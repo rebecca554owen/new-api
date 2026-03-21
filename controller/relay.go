@@ -178,10 +178,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}()
 
 	retryParam := &service.RetryParam{
-		Ctx:        c,
-		TokenGroup: relayInfo.TokenGroup,
-		ModelName:  relayInfo.OriginModelName,
-		Retry:      common.GetPointer(0),
+		Ctx:                   c,
+		TokenGroup:            relayInfo.TokenGroup,
+		ModelName:             relayInfo.OriginModelName,
+		Retry:                 common.GetPointer(0),
+		PreferredChannelTypes: types.RelayFormatToPreferredChannelTypes(relayInfo.RelayFormat),
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
