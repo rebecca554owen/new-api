@@ -93,10 +93,10 @@ func SyncChannelCache(frequency int) {
 	}
 }
 
-func GetRandomSatisfiedChannel(group string, model string, retry int) (*Channel, error) {
+func GetRandomSatisfiedChannel(group string, model string, retry int, preferredChannelTypes []int) (*Channel, error) {
 	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {
-		return GetChannel(group, model, retry)
+		return GetChannel(group, model, retry, preferredChannelTypes)
 	}
 
 	channelSyncLock.RLock()
@@ -120,6 +120,24 @@ func GetRandomSatisfiedChannel(group string, model string, retry int) (*Channel,
 			return channel, nil
 		}
 		return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channels[0])
+	}
+
+	// If preferred channel types are set, filter channels to prioritize native types
+	if len(preferredChannelTypes) > 0 {
+		typeSet := make(map[int]bool, len(preferredChannelTypes))
+		for _, t := range preferredChannelTypes {
+			typeSet[t] = true
+		}
+		var preferred []int
+		for _, channelId := range channels {
+			if ch, ok := channelsIDM[channelId]; ok && typeSet[ch.Type] {
+				preferred = append(preferred, channelId)
+			}
+		}
+		// Use preferred channels if any exist; otherwise fall back to all channels
+		if len(preferred) > 0 {
+			channels = preferred
+		}
 	}
 
 	uniquePriorities := make(map[int]bool)
