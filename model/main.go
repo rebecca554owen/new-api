@@ -61,6 +61,12 @@ func initCol() {
 	//common.SysLog("Using Log SQL Type: " + common.LogSqlType)
 }
 
+// InitDBColumnNames initializes quoted column names for callers that inject model.DB
+// directly in tests without going through InitDB().
+func InitDBColumnNames() {
+	initCol()
+}
+
 var DB *gorm.DB
 
 var LOG_DB *gorm.DB
