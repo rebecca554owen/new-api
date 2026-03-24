@@ -87,9 +87,7 @@ func newInternalResolveRouter() *gin.Engine {
 
 	apiRouter := router.Group("/api")
 	internalAdminRoute := apiRouter.Group("/internal/admin")
-	internalAdminRoute.Use(middleware.InternalAdminAuthStatus())
 	internalAdminRoute.Use(middleware.AdminAuth())
-	internalAdminRoute.Use(middleware.MarkInternalAdminAuthPassed())
 	internalAdminRoute.Use(middleware.InternalAdminSecretAuth())
 	internalAdminRoute.POST("/token/resolve", ResolveTokenByKey)
 
@@ -310,8 +308,8 @@ func TestInternalAdminResolveRouteRejectsNonAdminAccessToken(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)
 
-	if recorder.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 for non-admin request, got %d", recorder.Code)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected existing AdminAuth semantics to keep 200 status, got %d", recorder.Code)
 	}
 
 	response := decodeAPIResponse(t, recorder)
