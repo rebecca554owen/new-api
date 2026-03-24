@@ -170,6 +170,7 @@ func SetApiRouter(router *gin.Engine) {
 		internalAdminRoute.Use(middleware.InternalAdminSecretAuth())
 		{
 			internalAdminRoute.POST("/token/resolve", controller.ResolveTokenByKey)
+			internalAdminRoute.POST("/token/grant-quota", controller.GrantTokenQuota)
 		}
 		optionRoute := apiRouter.Group("/option")
 		optionRoute.Use(middleware.RootAuth())

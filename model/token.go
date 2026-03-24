@@ -400,11 +400,41 @@ func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
 	return increaseTokenQuota(tokenId, quota)
 }
 
+// GrantTokenRemainQuota is used by top-up flows to increase remain_quota only.
+func GrantTokenRemainQuota(tokenId int, key string, quota int) (err error) {
+	if quota < 0 {
+		return errors.New("quota 不能为负数！")
+	}
+	if common.RedisEnabled {
+		gopool.Go(func() {
+			err := cacheIncrTokenQuota(key, int64(quota))
+			if err != nil {
+				common.SysLog("failed to grant token remain quota: " + err.Error())
+			}
+		})
+	}
+	if common.BatchUpdateEnabled {
+		addNewRecord(BatchUpdateTypeTokenRemainQuota, tokenId, quota)
+		return nil
+	}
+	return grantTokenRemainQuota(tokenId, quota)
+}
+
 func increaseTokenQuota(id int, quota int) (err error) {
 	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
 		map[string]interface{}{
 			"remain_quota":  gorm.Expr("remain_quota + ?", quota),
 			"used_quota":    gorm.Expr("used_quota - ?", quota),
+			"accessed_time": common.GetTimestamp(),
+		},
+	).Error
+	return err
+}
+
+func grantTokenRemainQuota(id int, quota int) (err error) {
+	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
+		map[string]interface{}{
+			"remain_quota":  gorm.Expr("remain_quota + ?", quota),
 			"accessed_time": common.GetTimestamp(),
 		},
 	).Error
