@@ -165,6 +165,13 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.GET("/subscription/epay/notify", controller.SubscriptionEpayNotify)
 		apiRouter.GET("/subscription/epay/return", controller.SubscriptionEpayReturn)
 		apiRouter.POST("/subscription/epay/return", controller.SubscriptionEpayReturn)
+		internalAdminRoute := apiRouter.Group("/internal/admin")
+		internalAdminRoute.Use(middleware.AdminAuth())
+		internalAdminRoute.Use(middleware.InternalAdminSecretAuth())
+		{
+			internalAdminRoute.POST("/token/resolve", controller.ResolveTokenByKey)
+			internalAdminRoute.POST("/token/grant-quota", controller.GrantTokenQuota)
+		}
 		optionRoute := apiRouter.Group("/option")
 		optionRoute.Use(middleware.RootAuth())
 		{

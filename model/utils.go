@@ -17,6 +17,7 @@ const (
 	BatchUpdateTypeUsedQuota
 	BatchUpdateTypeChannelUsedQuota
 	BatchUpdateTypeRequestCount
+	BatchUpdateTypeTokenRemainQuota
 	BatchUpdateTypeCount // if you add a new type, you need to add a new map and a new lock
 )
 
@@ -91,6 +92,11 @@ func batchUpdate() {
 				updateUserRequestCount(key, value)
 			case BatchUpdateTypeChannelUsedQuota:
 				updateChannelUsedQuota(key, value)
+			case BatchUpdateTypeTokenRemainQuota:
+				err := grantTokenRemainQuota(key, value)
+				if err != nil {
+					common.SysLog("failed to batch grant token remain quota: " + err.Error())
+				}
 			}
 		}
 	}
