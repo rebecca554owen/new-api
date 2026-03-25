@@ -64,6 +64,12 @@ func GrantTokenQuota(c *gin.Context) {
 		return
 	}
 
+	token, err = model.GetTokenById(req.TokenID)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+
 	group, err := resolveTokenGroup(token)
 	if err != nil {
 		common.ApiError(c, err)

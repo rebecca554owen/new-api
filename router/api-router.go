@@ -167,10 +167,13 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.POST("/subscription/epay/return", controller.SubscriptionEpayReturn)
 		internalAdminRoute := apiRouter.Group("/internal/admin")
 		internalAdminRoute.Use(middleware.AdminAuth())
-		internalAdminRoute.Use(middleware.InternalAdminSecretAuth())
 		{
-			internalAdminRoute.POST("/token/resolve", controller.ResolveTokenByKey)
-			internalAdminRoute.POST("/token/grant-quota", controller.GrantTokenQuota)
+			internalAdminRoute.GET("/users", controller.InternalAdminListUsers)
+			internalAdminRoute.GET("/users/search", controller.InternalAdminSearchUsers)
+			internalAdminRoute.GET("/users/:id", controller.InternalAdminGetUser)
+			internalAdminRoute.POST("/users", controller.InternalAdminCreateUser)
+			internalAdminRoute.PUT("/users/:id", controller.InternalAdminUpdateUser)
+			internalAdminRoute.DELETE("/users/:id", controller.InternalAdminDeleteUser)
 		}
 		optionRoute := apiRouter.Group("/option")
 		optionRoute.Use(middleware.RootAuth())
@@ -252,6 +255,13 @@ func SetApiRouter(router *gin.Engine) {
 			channelRoute.POST("/upstream_updates/apply_all", controller.ApplyAllChannelUpstreamModelUpdates)
 			channelRoute.POST("/upstream_updates/detect", controller.DetectChannelUpstreamModelUpdates)
 			channelRoute.POST("/upstream_updates/detect_all", controller.DetectAllChannelUpstreamModelUpdates)
+		}
+		tokenAdminRoute := apiRouter.Group("/token/admin")
+		tokenAdminRoute.Use(middleware.AdminAuth())
+		{
+			tokenAdminRoute.GET("/search", controller.AdminSearchTokens)
+			tokenAdminRoute.GET("/:id", controller.AdminGetToken)
+			tokenAdminRoute.POST("/grant-quota", controller.AdminGrantTokenQuota)
 		}
 		tokenRoute := apiRouter.Group("/token")
 		tokenRoute.Use(middleware.UserAuth())

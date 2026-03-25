@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-contrib/sessions"
@@ -50,16 +49,15 @@ func seedGrantQuotaToken(t *testing.T, db *gorm.DB, userID int, rawKey string, r
 	return token
 }
 
-func newInternalGrantQuotaRouter() *gin.Engine {
+func newAdminGrantQuotaRouter() *gin.Engine {
 	router := gin.New()
 	store := cookie.NewStore([]byte("test-session-secret"))
 	router.Use(sessions.Sessions("test-session", store))
 
 	apiRouter := router.Group("/api")
-	internalAdminRoute := apiRouter.Group("/internal/admin")
-	internalAdminRoute.Use(middleware.AdminAuth())
-	internalAdminRoute.Use(middleware.InternalAdminSecretAuth())
-	internalAdminRoute.POST("/token/grant-quota", GrantTokenQuota)
+	tokenAdminRoute := apiRouter.Group("/token/admin")
+	tokenAdminRoute.Use(middleware.AdminAuth())
+	tokenAdminRoute.POST("/grant-quota", AdminGrantTokenQuota)
 
 	return router
 }
@@ -86,7 +84,7 @@ func TestGrantTokenQuotaSuccess(t *testing.T) {
 		"amount":  100000000,
 		"note":    "Topup order TOP20260325xxxx",
 	}
-	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/internal/admin/token/grant-quota", body, 1)
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/admin/grant-quota", body, 1)
 	GrantTokenQuota(ctx)
 
 	response := decodeAPIResponse(t, recorder)
@@ -134,7 +132,7 @@ func TestGrantTokenQuotaRejectsInvalidAmount(t *testing.T) {
 		"userId":  1,
 		"amount":  0,
 	}
-	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/internal/admin/token/grant-quota", body, 1)
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/admin/grant-quota", body, 1)
 	GrantTokenQuota(ctx)
 
 	response := decodeAPIResponse(t, recorder)
@@ -146,6 +144,47 @@ func TestGrantTokenQuotaRejectsInvalidAmount(t *testing.T) {
 	}
 }
 
+func TestGrantTokenQuotaRestoresExhaustedStatus(t *testing.T) {
+	db := setupInternalTokenControllerTestDB(t)
+	seedInternalUser(t, db, 4, common.RoleCommonUser, "default", "user-access-token")
+	token := seedGrantQuotaToken(t, db, 4, "grant-key-exhausted", 0, 100, "default", -1, false)
+	if err := db.Model(&model.Token{}).Where("id = ?", token.Id).Update("status", common.TokenStatusExhausted).Error; err != nil {
+		t.Fatalf("failed to set token exhausted status: %v", err)
+	}
+
+	body := map[string]any{
+		"tokenId": token.Id,
+		"userId":  4,
+		"amount":  10,
+	}
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/admin/grant-quota", body, 1)
+	GrantTokenQuota(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	if !response.Success {
+		t.Fatalf("expected success response, got message: %s", response.Message)
+	}
+
+	var granted grantQuotaResponse
+	if err := common.Unmarshal(response.Data, &granted); err != nil {
+		t.Fatalf("failed to decode grant quota response: %v", err)
+	}
+	if granted.Status != common.TokenStatusEnabled {
+		t.Fatalf("expected response status %d, got %d", common.TokenStatusEnabled, granted.Status)
+	}
+
+	updatedToken, err := model.GetTokenById(token.Id)
+	if err != nil {
+		t.Fatalf("failed to reload token: %v", err)
+	}
+	if updatedToken.Status != common.TokenStatusEnabled {
+		t.Fatalf("expected token status %d, got %d", common.TokenStatusEnabled, updatedToken.Status)
+	}
+	if updatedToken.RemainQuota != 10 {
+		t.Fatalf("expected remain quota 10, got %d", updatedToken.RemainQuota)
+	}
+}
+
 func TestGrantTokenQuotaReturnsNotFound(t *testing.T) {
 	setupInternalTokenControllerTestDB(t)
 
@@ -154,7 +193,7 @@ func TestGrantTokenQuotaReturnsNotFound(t *testing.T) {
 		"userId":  1,
 		"amount":  1,
 	}
-	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/internal/admin/token/grant-quota", body, 1)
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/admin/grant-quota", body, 1)
 	GrantTokenQuota(ctx)
 
 	response := decodeAPIResponse(t, recorder)
@@ -176,7 +215,7 @@ func TestGrantTokenQuotaRejectsTokenUserMismatch(t *testing.T) {
 		"userId":  5,
 		"amount":  10,
 	}
-	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/internal/admin/token/grant-quota", body, 1)
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/admin/grant-quota", body, 1)
 	GrantTokenQuota(ctx)
 
 	response := decodeAPIResponse(t, recorder)
@@ -188,53 +227,13 @@ func TestGrantTokenQuotaRejectsTokenUserMismatch(t *testing.T) {
 	}
 }
 
-func TestInternalAdminGrantQuotaRouteRequiresSecretHeader(t *testing.T) {
-	db := setupInternalTokenControllerTestDB(t)
-	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
-	token := seedGrantQuotaToken(t, db, 4, "grant-route-key-123", 100, 100, "default", -1, false)
-
-	originalSecret := constant.InternalAdminSecret
-	constant.InternalAdminSecret = "internal-secret"
-	t.Cleanup(func() {
-		constant.InternalAdminSecret = originalSecret
-	})
-
-	router := newInternalGrantQuotaRouter()
-	request := httptest.NewRequest(http.MethodPost, "/api/internal/admin/token/grant-quota", newInternalGrantQuotaRequest(t, map[string]any{
-		"tokenId": token.Id,
-		"userId":  4,
-		"amount":  10,
-	}))
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Authorization", "Bearer admin-access-token")
-	request.Header.Set("New-Api-User", "1")
-
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, request)
-
-	if recorder.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 when secret header missing, got %d", recorder.Code)
-	}
-
-	response := decodeAPIResponse(t, recorder)
-	if response.Success || response.Message != "forbidden" {
-		t.Fatalf("expected forbidden response, got %+v", response)
-	}
-}
-
-func TestInternalAdminGrantQuotaRouteAcceptsAdminWithSecret(t *testing.T) {
+func TestAdminGrantQuotaRouteAcceptsAdmin(t *testing.T) {
 	db := setupInternalTokenControllerTestDB(t)
 	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
 	token := seedGrantQuotaToken(t, db, 4, "grant-route-key-456", 100, 100, "default", -1, false)
 
-	originalSecret := constant.InternalAdminSecret
-	constant.InternalAdminSecret = "internal-secret"
-	t.Cleanup(func() {
-		constant.InternalAdminSecret = originalSecret
-	})
-
-	router := newInternalGrantQuotaRouter()
-	request := httptest.NewRequest(http.MethodPost, "/api/internal/admin/token/grant-quota", newInternalGrantQuotaRequest(t, map[string]any{
+	router := newAdminGrantQuotaRouter()
+	request := httptest.NewRequest(http.MethodPost, "/api/token/admin/grant-quota", newInternalGrantQuotaRequest(t, map[string]any{
 		"tokenId": token.Id,
 		"userId":  4,
 		"amount":  10,
@@ -243,7 +242,6 @@ func TestInternalAdminGrantQuotaRouteAcceptsAdminWithSecret(t *testing.T) {
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer admin-access-token")
 	request.Header.Set("New-Api-User", "1")
-	request.Header.Set("X-Internal-Admin-Secret", "internal-secret")
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)
@@ -266,19 +264,13 @@ func TestInternalAdminGrantQuotaRouteAcceptsAdminWithSecret(t *testing.T) {
 	}
 }
 
-func TestInternalAdminGrantQuotaRouteRejectsNonAdminAccessToken(t *testing.T) {
+func TestAdminGrantQuotaRouteRejectsNonAdminAccessToken(t *testing.T) {
 	db := setupInternalTokenControllerTestDB(t)
 	seedInternalUser(t, db, 2, common.RoleCommonUser, "default", "common-access-token")
 	token := seedGrantQuotaToken(t, db, 4, "grant-route-key-789", 100, 100, "default", -1, false)
 
-	originalSecret := constant.InternalAdminSecret
-	constant.InternalAdminSecret = "internal-secret"
-	t.Cleanup(func() {
-		constant.InternalAdminSecret = originalSecret
-	})
-
-	router := newInternalGrantQuotaRouter()
-	request := httptest.NewRequest(http.MethodPost, "/api/internal/admin/token/grant-quota", newInternalGrantQuotaRequest(t, map[string]any{
+	router := newAdminGrantQuotaRouter()
+	request := httptest.NewRequest(http.MethodPost, "/api/token/admin/grant-quota", newInternalGrantQuotaRequest(t, map[string]any{
 		"tokenId": token.Id,
 		"userId":  4,
 		"amount":  10,
@@ -286,7 +278,6 @@ func TestInternalAdminGrantQuotaRouteRejectsNonAdminAccessToken(t *testing.T) {
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer common-access-token")
 	request.Header.Set("New-Api-User", "2")
-	request.Header.Set("X-Internal-Admin-Secret", "internal-secret")
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)

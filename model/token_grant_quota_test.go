@@ -37,6 +37,17 @@ func seedGrantQuotaModelToken(t *testing.T, remainQuota int, usedQuota int) *Tok
 	return token
 }
 
+func seedGrantQuotaModelTokenWithStatus(t *testing.T, remainQuota int, usedQuota int, status int) *Token {
+	t.Helper()
+
+	token := seedGrantQuotaModelToken(t, remainQuota, usedQuota)
+	token.Status = status
+	if err := DB.Model(&Token{}).Where("id = ?", token.Id).Update("status", status).Error; err != nil {
+		t.Fatalf("failed to update token status: %v", err)
+	}
+	return token
+}
+
 func TestGrantTokenRemainQuotaUpdatesRemainOnly(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateStores()
@@ -110,5 +121,34 @@ func TestGrantTokenRemainQuotaBatchUpdatesRemainOnly(t *testing.T) {
 	}
 	if updatedToken.RemainQuota+updatedToken.UsedQuota != beforeTotalGranted+30 {
 		t.Fatalf("expected total granted quota %d, got %d", beforeTotalGranted+30, updatedToken.RemainQuota+updatedToken.UsedQuota)
+	}
+}
+
+func TestGrantTokenRemainQuotaRestoresExhaustedStatus(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateStores()
+
+	originalBatchUpdateEnabled := common.BatchUpdateEnabled
+	common.BatchUpdateEnabled = false
+	t.Cleanup(func() {
+		common.BatchUpdateEnabled = originalBatchUpdateEnabled
+		resetBatchUpdateStores()
+	})
+
+	token := seedGrantQuotaModelTokenWithStatus(t, 0, 40, common.TokenStatusExhausted)
+
+	if err := GrantTokenRemainQuota(token.Id, token.Key, 25); err != nil {
+		t.Fatalf("failed to grant token remain quota: %v", err)
+	}
+
+	updatedToken, err := GetTokenById(token.Id)
+	if err != nil {
+		t.Fatalf("failed to reload token: %v", err)
+	}
+	if updatedToken.RemainQuota != 25 {
+		t.Fatalf("expected remain quota 25, got %d", updatedToken.RemainQuota)
+	}
+	if updatedToken.Status != common.TokenStatusEnabled {
+		t.Fatalf("expected token status %d, got %d", common.TokenStatusEnabled, updatedToken.Status)
 	}
 }

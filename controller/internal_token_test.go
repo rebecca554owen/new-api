@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"bytes"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-contrib/sessions"
@@ -18,14 +16,9 @@ import (
 	"gorm.io/gorm"
 )
 
-type internalResolveResponse struct {
-	TokenID        int    `json:"tokenId"`
-	UserID         int    `json:"userId"`
-	Name           string `json:"name"`
-	Group          string `json:"group"`
-	Status         int    `json:"status"`
-	ExpiredTime    int64  `json:"expiredTime"`
-	UnlimitedQuota bool   `json:"unlimitedQuota"`
+type adminTokenSearchPage struct {
+	Total int            `json:"total"`
+	Items []*model.Token `json:"items"`
 }
 
 func setupInternalTokenControllerTestDB(t *testing.T) *gorm.DB {
@@ -51,6 +44,7 @@ func seedInternalUser(t *testing.T, db *gorm.DB, userID int, role int, group str
 		Status:      common.UserStatusEnabled,
 		Email:       fmt.Sprintf("user_%d@example.com", userID),
 		Group:       group,
+		AffCode:     fmt.Sprintf("aff%d", userID),
 		AccessToken: &token,
 	}
 	if err := db.Create(user).Error; err != nil {
@@ -80,160 +74,118 @@ func seedInternalLookupToken(t *testing.T, db *gorm.DB, userID int, name string,
 	return token
 }
 
-func newInternalResolveRouter() *gin.Engine {
+func newAdminTokenSearchRouter() *gin.Engine {
 	router := gin.New()
 	store := cookie.NewStore([]byte("test-session-secret"))
 	router.Use(sessions.Sessions("test-session", store))
 
 	apiRouter := router.Group("/api")
-	internalAdminRoute := apiRouter.Group("/internal/admin")
-	internalAdminRoute.Use(middleware.AdminAuth())
-	internalAdminRoute.Use(middleware.InternalAdminSecretAuth())
-	internalAdminRoute.POST("/token/resolve", ResolveTokenByKey)
+	tokenAdminRoute := apiRouter.Group("/token/admin")
+	tokenAdminRoute.Use(middleware.AdminAuth())
+	tokenAdminRoute.GET("/search", AdminSearchTokens)
 
 	return router
 }
 
-func newInternalResolveRequest(t *testing.T, key string) *bytes.Reader {
-	t.Helper()
-
-	payload, err := common.Marshal(map[string]any{"key": key})
-	if err != nil {
-		t.Fatalf("failed to marshal request body: %v", err)
-	}
-	return bytes.NewReader(payload)
-}
-
-func TestResolveTokenByKeySuccess(t *testing.T) {
+func TestAdminSearchTokensSuccess(t *testing.T) {
 	db := setupInternalTokenControllerTestDB(t)
 	seedInternalUser(t, db, 4, common.RoleCommonUser, "default", "user-access-token")
 	token := seedInternalLookupToken(t, db, 4, "自动发货-3-24-V6rhKT", "resolve-key-123", "default", false)
 
-	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/internal/admin/token/resolve", map[string]any{"key": "sk-resolve-key-123"}, 1)
-	ResolveTokenByKey(ctx)
+	ctx, recorder := newAuthenticatedContext(t, http.MethodGet, "/api/token/admin/search?token=sk-resolve-key-123", nil, 1)
+	AdminSearchTokens(ctx)
 
 	response := decodeAPIResponse(t, recorder)
 	if !response.Success {
 		t.Fatalf("expected success response, got message: %s", response.Message)
 	}
 
-	var resolved internalResolveResponse
-	if err := common.Unmarshal(response.Data, &resolved); err != nil {
-		t.Fatalf("failed to decode resolve response: %v", err)
+	var page adminTokenSearchPage
+	if err := common.Unmarshal(response.Data, &page); err != nil {
+		t.Fatalf("failed to decode search response: %v", err)
 	}
-	if resolved.TokenID != token.Id || resolved.UserID != token.UserId {
-		t.Fatalf("unexpected token identity: %+v", resolved)
+	if page.Total != 1 || len(page.Items) != 1 {
+		t.Fatalf("expected one search result, got %+v", page)
 	}
-	if resolved.Name != token.Name || resolved.Group != token.Group {
-		t.Fatalf("unexpected token details: %+v", resolved)
+	found := page.Items[0]
+	if found.Id != token.Id || found.UserId != token.UserId {
+		t.Fatalf("unexpected token identity: %+v", found)
 	}
-	if resolved.Status != token.Status || resolved.ExpiredTime != token.ExpiredTime || resolved.UnlimitedQuota != token.UnlimitedQuota {
-		t.Fatalf("unexpected token flags: %+v", resolved)
+	if found.Name != token.Name || found.Group != token.Group {
+		t.Fatalf("unexpected token details: %+v", found)
+	}
+	if found.Status != token.Status || found.ExpiredTime != token.ExpiredTime || found.UnlimitedQuota != token.UnlimitedQuota {
+		t.Fatalf("unexpected token flags: %+v", found)
 	}
 	if strings.Contains(recorder.Body.String(), token.Key) {
-		t.Fatalf("resolve response leaked raw token key: %s", recorder.Body.String())
+		t.Fatalf("search response leaked raw token key: %s", recorder.Body.String())
 	}
 }
 
-func TestResolveTokenByKeyRejectsKeyWithoutPrefix(t *testing.T) {
-	setupInternalTokenControllerTestDB(t)
+func TestAdminSearchTokensSupportsKeyWithoutPrefix(t *testing.T) {
+	db := setupInternalTokenControllerTestDB(t)
+	seedInternalUser(t, db, 4, common.RoleCommonUser, "default", "user-access-token")
+	seedInternalLookupToken(t, db, 4, "plain-token", "resolve-key-no-prefix", "default", false)
 
-	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/internal/admin/token/resolve", map[string]any{"key": "resolve-key-123"}, 1)
-	ResolveTokenByKey(ctx)
+	ctx, recorder := newAuthenticatedContext(t, http.MethodGet, "/api/token/admin/search?token=resolve-key-no-prefix", nil, 1)
+	AdminSearchTokens(ctx)
 
 	response := decodeAPIResponse(t, recorder)
-	if response.Success {
-		t.Fatalf("expected invalid key format failure")
-	}
-	if response.Message != "invalid key format" {
-		t.Fatalf("expected invalid key format message, got %q", response.Message)
+	if !response.Success {
+		t.Fatalf("expected search success")
 	}
 }
 
-func TestResolveTokenByKeyReturnsNotFound(t *testing.T) {
+func TestAdminSearchTokensReturnsEmptyWhenNotFound(t *testing.T) {
 	setupInternalTokenControllerTestDB(t)
 
-	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/internal/admin/token/resolve", map[string]any{"key": "sk-missing-key"}, 1)
-	ResolveTokenByKey(ctx)
+	ctx, recorder := newAuthenticatedContext(t, http.MethodGet, "/api/token/admin/search?token=sk-missing-key", nil, 1)
+	AdminSearchTokens(ctx)
 
 	response := decodeAPIResponse(t, recorder)
-	if response.Success {
-		t.Fatalf("expected missing token failure")
+	if !response.Success {
+		t.Fatalf("expected empty search success")
 	}
-	if response.Message != "token not found" {
-		t.Fatalf("expected token not found message, got %q", response.Message)
+	var page adminTokenSearchPage
+	if err := common.Unmarshal(response.Data, &page); err != nil {
+		t.Fatalf("failed to decode empty search response: %v", err)
+	}
+	if page.Total != 0 || len(page.Items) != 0 {
+		t.Fatalf("expected empty search result, got %+v", page)
 	}
 }
 
-func TestResolveTokenByKeyFallsBackToUserGroup(t *testing.T) {
+func TestAdminSearchTokensFallsBackToUserGroup(t *testing.T) {
 	db := setupInternalTokenControllerTestDB(t)
 	seedInternalUser(t, db, 9, common.RoleCommonUser, "vip", "vip-access-token")
 	seedInternalLookupToken(t, db, 9, "group-fallback-token", "fallback-key-123", "", true)
 
-	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/internal/admin/token/resolve", map[string]any{"key": "sk-fallback-key-123"}, 1)
-	ResolveTokenByKey(ctx)
+	ctx, recorder := newAuthenticatedContext(t, http.MethodGet, "/api/token/admin/search?token=sk-fallback-key-123", nil, 1)
+	AdminSearchTokens(ctx)
 
 	response := decodeAPIResponse(t, recorder)
 	if !response.Success {
 		t.Fatalf("expected success response, got message: %s", response.Message)
 	}
 
-	var resolved internalResolveResponse
-	if err := common.Unmarshal(response.Data, &resolved); err != nil {
+	var page adminTokenSearchPage
+	if err := common.Unmarshal(response.Data, &page); err != nil {
 		t.Fatalf("failed to decode fallback response: %v", err)
 	}
-	if resolved.Group != "vip" {
-		t.Fatalf("expected fallback group vip, got %q", resolved.Group)
+	if len(page.Items) != 1 || page.Items[0].Group != "vip" {
+		t.Fatalf("expected fallback group vip, got %+v", page.Items)
 	}
 }
 
-func TestInternalAdminResolveRouteRequiresSecretHeader(t *testing.T) {
-	db := setupInternalTokenControllerTestDB(t)
-	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
-	seedInternalLookupToken(t, db, 4, "route-token", "route-key-123", "default", false)
-
-	originalSecret := constant.InternalAdminSecret
-	constant.InternalAdminSecret = "internal-secret"
-	t.Cleanup(func() {
-		constant.InternalAdminSecret = originalSecret
-	})
-
-	router := newInternalResolveRouter()
-	request := httptest.NewRequest(http.MethodPost, "/api/internal/admin/token/resolve", newInternalResolveRequest(t, "sk-route-key-123"))
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Authorization", "Bearer admin-access-token")
-	request.Header.Set("New-Api-User", "1")
-
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, request)
-
-	if recorder.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 when secret header missing, got %d", recorder.Code)
-	}
-
-	response := decodeAPIResponse(t, recorder)
-	if response.Success || response.Message != "forbidden" {
-		t.Fatalf("expected forbidden response, got %+v", response)
-	}
-}
-
-func TestInternalAdminResolveRouteAcceptsAdminWithSecret(t *testing.T) {
+func TestAdminTokenSearchRouteAcceptsAdmin(t *testing.T) {
 	db := setupInternalTokenControllerTestDB(t)
 	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
 	token := seedInternalLookupToken(t, db, 4, "route-token", "route-key-456", "default", false)
 
-	originalSecret := constant.InternalAdminSecret
-	constant.InternalAdminSecret = "internal-secret"
-	t.Cleanup(func() {
-		constant.InternalAdminSecret = originalSecret
-	})
-
-	router := newInternalResolveRouter()
-	request := httptest.NewRequest(http.MethodPost, "/api/internal/admin/token/resolve", newInternalResolveRequest(t, "sk-route-key-456"))
-	request.Header.Set("Content-Type", "application/json")
+	router := newAdminTokenSearchRouter()
+	request := httptest.NewRequest(http.MethodGet, "/api/token/admin/search?token=sk-route-key-456", nil)
 	request.Header.Set("Authorization", "Bearer admin-access-token")
 	request.Header.Set("New-Api-User", "1")
-	request.Header.Set("X-Internal-Admin-Secret", "internal-secret")
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)
@@ -247,63 +199,24 @@ func TestInternalAdminResolveRouteAcceptsAdminWithSecret(t *testing.T) {
 		t.Fatalf("expected success response, got %+v", response)
 	}
 
-	var resolved internalResolveResponse
-	if err := common.Unmarshal(response.Data, &resolved); err != nil {
-		t.Fatalf("failed to decode route resolve response: %v", err)
+	var page adminTokenSearchPage
+	if err := common.Unmarshal(response.Data, &page); err != nil {
+		t.Fatalf("failed to decode route search response: %v", err)
 	}
-	if resolved.TokenID != token.Id || resolved.UserID != token.UserId {
-		t.Fatalf("unexpected route resolve response: %+v", resolved)
-	}
-}
-
-func TestInternalAdminResolveRouteRejectsWhenSecretNotConfigured(t *testing.T) {
-	db := setupInternalTokenControllerTestDB(t)
-	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
-	seedInternalLookupToken(t, db, 4, "route-token", "route-key-config", "default", false)
-
-	originalSecret := constant.InternalAdminSecret
-	constant.InternalAdminSecret = ""
-	t.Cleanup(func() {
-		constant.InternalAdminSecret = originalSecret
-	})
-
-	router := newInternalResolveRouter()
-	request := httptest.NewRequest(http.MethodPost, "/api/internal/admin/token/resolve", newInternalResolveRequest(t, "sk-route-key-config"))
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Authorization", "Bearer admin-access-token")
-	request.Header.Set("New-Api-User", "1")
-	request.Header.Set("X-Internal-Admin-Secret", "unused")
-
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, request)
-
-	if recorder.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 when internal secret is missing, got %d", recorder.Code)
-	}
-
-	response := decodeAPIResponse(t, recorder)
-	if response.Success || response.Message != "internal admin secret not configured" {
-		t.Fatalf("expected explicit config error, got %+v", response)
+	if len(page.Items) != 1 || page.Items[0].Id != token.Id || page.Items[0].UserId != token.UserId {
+		t.Fatalf("unexpected route search response: %+v", page)
 	}
 }
 
-func TestInternalAdminResolveRouteRejectsNonAdminAccessToken(t *testing.T) {
+func TestAdminTokenSearchRouteRejectsNonAdminAccessToken(t *testing.T) {
 	db := setupInternalTokenControllerTestDB(t)
 	seedInternalUser(t, db, 2, common.RoleCommonUser, "default", "common-access-token")
 	seedInternalLookupToken(t, db, 4, "route-token", "route-key-789", "default", false)
 
-	originalSecret := constant.InternalAdminSecret
-	constant.InternalAdminSecret = "internal-secret"
-	t.Cleanup(func() {
-		constant.InternalAdminSecret = originalSecret
-	})
-
-	router := newInternalResolveRouter()
-	request := httptest.NewRequest(http.MethodPost, "/api/internal/admin/token/resolve", newInternalResolveRequest(t, "sk-route-key-789"))
-	request.Header.Set("Content-Type", "application/json")
+	router := newAdminTokenSearchRouter()
+	request := httptest.NewRequest(http.MethodGet, "/api/token/admin/search?token=sk-route-key-789", nil)
 	request.Header.Set("Authorization", "Bearer common-access-token")
 	request.Header.Set("New-Api-User", "2")
-	request.Header.Set("X-Internal-Admin-Secret", "internal-secret")
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)
