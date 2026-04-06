@@ -18,6 +18,7 @@ type internalAdminUpdateUserRequest struct {
 	Group       *string `json:"group"`
 	Quota       *int    `json:"quota"`
 	Remark      *string `json:"remark"`
+	Note        *string `json:"note"`
 }
 
 func InternalAdminListUsers(c *gin.Context) {
@@ -114,6 +115,7 @@ func InternalAdminUpdateUser(c *gin.Context) {
 		Group:       req.Group,
 		Quota:       req.Quota,
 		Remark:      req.Remark,
+		Note:        req.Note,
 	})
 	if err != nil {
 		if errors.Is(err, errAdminPermissionHigherLevel) {
