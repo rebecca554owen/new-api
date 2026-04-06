@@ -153,6 +153,47 @@ func TestInternalAdminUpdateUserQuotaPreservesExistingFields(t *testing.T) {
 	}
 }
 
+func TestInternalAdminUpdateUserQuotaWritesManageLogWithNote(t *testing.T) {
+	db := setupInternalTokenControllerTestDB(t)
+	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
+	target := seedInternalUser(t, db, 8, common.RoleCommonUser, "default", "target-access-token")
+	if err := db.Model(&model.User{}).Where("id = ?", target.Id).Update("quota", 100).Error; err != nil {
+		t.Fatalf("failed to update initial quota: %v", err)
+	}
+
+	router := newInternalUserRouter()
+	request := httptest.NewRequest(http.MethodPut, "/api/internal/admin/users/"+strconv.Itoa(target.Id), newInternalUserRequest(t, map[string]any{
+		"quota": 180,
+		"note":  "Topup order BUY20260406; source saas",
+	}))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer admin-access-token")
+	request.Header.Set("New-Api-User", "1")
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	response := decodeAPIResponse(t, recorder)
+	if !response.Success {
+		t.Fatalf("expected success response, got %+v", response)
+	}
+
+	var logs []model.Log
+	if err := db.Where("user_id = ? AND type = ?", target.Id, model.LogTypeManage).Find(&logs).Error; err != nil {
+		t.Fatalf("failed to query manage logs: %v", err)
+	}
+	if len(logs) == 0 {
+		t.Fatalf("expected manage log to be created")
+	}
+	content := logs[len(logs)-1].Content
+	if !strings.Contains(content, "管理员将用户额度从") {
+		t.Fatalf("expected quota change content, got %q", content)
+	}
+	if !strings.Contains(content, "Topup order BUY20260406; source saas") {
+		t.Fatalf("expected note in log content, got %q", content)
+	}
+}
+
 func TestInternalAdminCreateUserSucceeds(t *testing.T) {
 	db := setupInternalTokenControllerTestDB(t)
 	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")

@@ -122,6 +122,21 @@ func TestGrantTokenQuotaSuccess(t *testing.T) {
 	if updatedToken.Group != token.Group || updatedToken.ExpiredTime != token.ExpiredTime || updatedToken.UnlimitedQuota != token.UnlimitedQuota {
 		t.Fatalf("token metadata changed unexpectedly: before=%+v after=%+v", token, updatedToken)
 	}
+
+	var logs []model.Log
+	if err := db.Where("user_id = ? AND type = ?", token.UserId, model.LogTypeTopup).Find(&logs).Error; err != nil {
+		t.Fatalf("failed to query topup logs: %v", err)
+	}
+	if len(logs) == 0 {
+		t.Fatalf("expected topup log to be created")
+	}
+	content := logs[len(logs)-1].Content
+	if !strings.Contains(content, "管理员为令牌") {
+		t.Fatalf("expected token quota grant log, got %q", content)
+	}
+	if !strings.Contains(content, "Topup order TOP20260325xxxx") {
+		t.Fatalf("expected note in token quota grant log, got %q", content)
+	}
 }
 
 func TestGrantTokenQuotaRejectsInvalidAmount(t *testing.T) {

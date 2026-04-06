@@ -2,8 +2,11 @@ package controller
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -25,6 +28,15 @@ type GrantTokenQuotaResponse struct {
 	Status            int    `json:"status"`
 	ExpiredTime       int64  `json:"expiredTime"`
 	UnlimitedQuota    bool   `json:"unlimitedQuota"`
+}
+
+func formatTokenQuotaGrantLog(token *model.Token, amount int, note string) string {
+	message := fmt.Sprintf("管理员为令牌 %s(ID:%d) 增加额度 %s", token.Name, token.Id, logger.LogQuota(amount))
+	trimmed := strings.TrimSpace(note)
+	if trimmed == "" {
+		return message
+	}
+	return fmt.Sprintf("%s，备注：%s", message, trimmed)
 }
 
 func GrantTokenQuota(c *gin.Context) {
@@ -63,6 +75,7 @@ func GrantTokenQuota(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	model.RecordLog(token.UserId, model.LogTypeTopup, formatTokenQuotaGrantLog(token, req.Amount, req.Note))
 
 	token, err = model.GetTokenById(req.TokenID)
 	if err != nil {

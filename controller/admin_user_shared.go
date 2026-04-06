@@ -33,6 +33,19 @@ type adminUpdateUserInput struct {
 	Group       *string
 	Quota       *int
 	Remark      *string
+	Note        *string
+}
+
+func formatQuotaChangeLog(beforeQuota int, afterQuota int, note *string) string {
+	message := fmt.Sprintf("管理员将用户额度从 %s修改为 %s", logger.LogQuota(beforeQuota), logger.LogQuota(afterQuota))
+	if note == nil {
+		return message
+	}
+	trimmed := strings.TrimSpace(*note)
+	if trimmed == "" {
+		return message
+	}
+	return fmt.Sprintf("%s，备注：%s", message, trimmed)
 }
 
 func adminListUsers(pageInfo *common.PageInfo) (*common.PageInfo, error) {
@@ -147,7 +160,7 @@ func adminUpdateUser(operatorRole int, input adminUpdateUserInput) (*model.User,
 		return nil, err
 	}
 	if originUser.Quota != updatedUser.Quota {
-		model.RecordLog(originUser.Id, model.LogTypeManage, fmt.Sprintf("管理员将用户额度从 %s修改为 %s", logger.LogQuota(originUser.Quota), logger.LogQuota(updatedUser.Quota)))
+		model.RecordLog(originUser.Id, model.LogTypeManage, formatQuotaChangeLog(originUser.Quota, updatedUser.Quota, input.Note))
 	}
 	return model.GetUserById(updatedUser.Id, false)
 }
