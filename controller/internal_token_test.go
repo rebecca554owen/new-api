@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -83,6 +84,7 @@ func newAdminTokenSearchRouter() *gin.Engine {
 	tokenAdminRoute := apiRouter.Group("/token/admin")
 	tokenAdminRoute.Use(middleware.AdminAuth())
 	tokenAdminRoute.GET("/search", AdminSearchTokens)
+	tokenAdminRoute.POST("/:id/key", AdminGetTokenKey)
 
 	return router
 }
@@ -231,5 +233,36 @@ func TestAdminTokenSearchRouteRejectsNonAdminAccessToken(t *testing.T) {
 	}
 	if !strings.Contains(response.Message, "权限不足") {
 		t.Fatalf("expected permission denied message, got %q", response.Message)
+	}
+}
+
+func TestAdminGetTokenKeyRouteReturnsFullKey(t *testing.T) {
+	db := setupInternalTokenControllerTestDB(t)
+	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
+	token := seedInternalLookupToken(t, db, 4, "route-token", "route-key-secret", "default", false)
+
+	router := newAdminTokenSearchRouter()
+	request := httptest.NewRequest(http.MethodPost, "/api/token/admin/"+strconv.Itoa(token.Id)+"/key", nil)
+	request.Header.Set("Authorization", "Bearer admin-access-token")
+	request.Header.Set("New-Api-User", "1")
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 for authorized request, got %d", recorder.Code)
+	}
+
+	response := decodeAPIResponse(t, recorder)
+	if !response.Success {
+		t.Fatalf("expected success response, got %+v", response)
+	}
+
+	var keyData tokenKeyResponse
+	if err := common.Unmarshal(response.Data, &keyData); err != nil {
+		t.Fatalf("failed to decode token key response: %v", err)
+	}
+	if keyData.Key != "sk-"+token.GetFullKey() {
+		t.Fatalf("expected full prefixed key %q, got %q", "sk-"+token.GetFullKey(), keyData.Key)
 	}
 }

@@ -261,6 +261,7 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			tokenAdminRoute.GET("/search", controller.AdminSearchTokens)
 			tokenAdminRoute.GET("/:id", controller.AdminGetToken)
+			tokenAdminRoute.POST("/:id/key", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.AdminGetTokenKey)
 			tokenAdminRoute.POST("/grant-quota", controller.AdminGrantTokenQuota)
 		}
 		tokenRoute := apiRouter.Group("/token")
