@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -83,8 +84,11 @@ func newAdminTokenSearchRouter() *gin.Engine {
 	apiRouter := router.Group("/api")
 	tokenAdminRoute := apiRouter.Group("/token/admin")
 	tokenAdminRoute.Use(middleware.AdminAuth())
+	tokenAdminRoute.GET("/", AdminGetAllTokens)
 	tokenAdminRoute.GET("/search", AdminSearchTokens)
 	tokenAdminRoute.POST("/:id/key", AdminGetTokenKey)
+	tokenAdminRoute.PUT("/", middleware.RootAuth(), AdminUpdateToken)
+	tokenAdminRoute.DELETE("/:id", middleware.RootAuth(), AdminDeleteToken)
 
 	return router
 }
@@ -179,6 +183,149 @@ func TestAdminSearchTokensFallsBackToUserGroup(t *testing.T) {
 	}
 }
 
+func TestAdminSearchTokensSupportsFuzzyKeywordAndUsername(t *testing.T) {
+	db := setupInternalTokenControllerTestDB(t)
+	seedInternalUser(t, db, 8, common.RoleCommonUser, "default", "user8-access-token")
+	token := seedInternalLookupToken(t, db, 8, "alpha-diagnose-token", "alpha-key-123", "default", false)
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodGet, "/api/token/admin/search?keyword=diagnose&username=user_8", nil, 1)
+	AdminSearchTokens(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	if !response.Success {
+		t.Fatalf("expected success response, got message: %s", response.Message)
+	}
+
+	var page adminTokenSearchPage
+	if err := common.Unmarshal(response.Data, &page); err != nil {
+		t.Fatalf("failed to decode fuzzy search response: %v", err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 {
+		t.Fatalf("expected one fuzzy search result, got %+v", page)
+	}
+	if page.Items[0].Id != token.Id || page.Items[0].Username != "user_8" {
+		t.Fatalf("unexpected fuzzy search result: %+v", page.Items[0])
+	}
+}
+
+func TestAdminSearchTokensSupportsFuzzyTokenKey(t *testing.T) {
+	db := setupInternalTokenControllerTestDB(t)
+	seedInternalUser(t, db, 11, common.RoleCommonUser, "default", "user11-access-token")
+	token := seedInternalLookupToken(t, db, 11, "beta-token", "diagnose-key-xyz", "default", false)
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodGet, "/api/token/admin/search?token=key-xy", nil, 1)
+	AdminSearchTokens(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	if !response.Success {
+		t.Fatalf("expected success response, got message: %s", response.Message)
+	}
+
+	var page adminTokenSearchPage
+	if err := common.Unmarshal(response.Data, &page); err != nil {
+		t.Fatalf("failed to decode fuzzy token search response: %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].Id != token.Id {
+		t.Fatalf("unexpected fuzzy token search response: %+v", page.Items)
+	}
+}
+
+func TestAdminGetTokenKeyRouteAcceptsAdmin(t *testing.T) {
+	db := setupInternalTokenControllerTestDB(t)
+	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
+	token := seedInternalLookupToken(t, db, 4, "route-token", "route-real-key-123", "default", false)
+
+	router := newAdminTokenSearchRouter()
+	request := httptest.NewRequest(http.MethodPost, "/api/token/admin/"+strconv.Itoa(token.Id)+"/key", nil)
+	request.Header.Set("Authorization", "Bearer admin-access-token")
+	request.Header.Set("New-Api-User", "1")
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	response := decodeAPIResponse(t, recorder)
+	if !response.Success {
+		t.Fatalf("expected success response, got %+v", response)
+	}
+	var payload struct {
+		Key string `json:"key"`
+	}
+	if err := common.Unmarshal(response.Data, &payload); err != nil {
+		t.Fatalf("failed to decode admin token key response: %v", err)
+	}
+	if payload.Key != token.Key {
+		t.Fatalf("expected full key %q, got %q", token.Key, payload.Key)
+	}
+}
+
+func TestAdminUpdateTokenRouteRejectsAdminButAcceptsRoot(t *testing.T) {
+	db := setupInternalTokenControllerTestDB(t)
+	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
+	seedInternalUser(t, db, 2, common.RoleRootUser, "default", "root-access-token")
+	seedInternalUser(t, db, 4, common.RoleCommonUser, "default", "user4-access-token")
+	token := seedInternalLookupToken(t, db, 4, "editable-token", "editable-real-key", "default", false)
+
+	router := newAdminTokenSearchRouter()
+
+	adminBody, err := common.Marshal(map[string]any{
+		"id":                   token.Id,
+		"name":                 "updated-by-admin",
+		"remain_quota":         token.RemainQuota,
+		"expired_time":         token.ExpiredTime,
+		"unlimited_quota":      token.UnlimitedQuota,
+		"model_limits":         "",
+		"model_limits_enabled": false,
+		"group":                token.Group,
+		"cross_group_retry":    false,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal admin update body: %v", err)
+	}
+	adminRequest := httptest.NewRequest(http.MethodPut, "/api/token/admin/", bytes.NewReader(adminBody))
+	adminRequest.Header.Set("Content-Type", "application/json")
+	adminRequest.Header.Set("Authorization", "Bearer admin-access-token")
+	adminRequest.Header.Set("New-Api-User", "1")
+	adminRecorder := httptest.NewRecorder()
+	router.ServeHTTP(adminRecorder, adminRequest)
+	adminResponse := decodeAPIResponse(t, adminRecorder)
+	if adminResponse.Success {
+		t.Fatalf("expected admin update to fail")
+	}
+
+	rootBody, err := common.Marshal(map[string]any{
+		"id":                   token.Id,
+		"name":                 "updated-by-root",
+		"remain_quota":         token.RemainQuota,
+		"expired_time":         token.ExpiredTime,
+		"unlimited_quota":      token.UnlimitedQuota,
+		"model_limits":         "",
+		"model_limits_enabled": false,
+		"group":                token.Group,
+		"cross_group_retry":    false,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal root update body: %v", err)
+	}
+	rootRequest := httptest.NewRequest(http.MethodPut, "/api/token/admin/", bytes.NewReader(rootBody))
+	rootRequest.Header.Set("Content-Type", "application/json")
+	rootRequest.Header.Set("Authorization", "Bearer root-access-token")
+	rootRequest.Header.Set("New-Api-User", "2")
+	rootRecorder := httptest.NewRecorder()
+	router.ServeHTTP(rootRecorder, rootRequest)
+	rootResponse := decodeAPIResponse(t, rootRecorder)
+	if !rootResponse.Success {
+		t.Fatalf("expected root update to succeed, got %+v", rootResponse)
+	}
+
+	updatedToken, err := model.GetTokenById(token.Id)
+	if err != nil {
+		t.Fatalf("failed to reload updated token: %v", err)
+	}
+	if updatedToken.Name != "updated-by-root" {
+		t.Fatalf("expected token name updated-by-root, got %q", updatedToken.Name)
+	}
+}
+
 func TestAdminTokenSearchRouteAcceptsAdmin(t *testing.T) {
 	db := setupInternalTokenControllerTestDB(t)
 	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
@@ -262,7 +409,7 @@ func TestAdminGetTokenKeyRouteReturnsFullKey(t *testing.T) {
 	if err := common.Unmarshal(response.Data, &keyData); err != nil {
 		t.Fatalf("failed to decode token key response: %v", err)
 	}
-	if keyData.Key != "sk-"+token.GetFullKey() {
-		t.Fatalf("expected full prefixed key %q, got %q", "sk-"+token.GetFullKey(), keyData.Key)
+	if keyData.Key != token.GetFullKey() {
+		t.Fatalf("expected full key %q, got %q", token.GetFullKey(), keyData.Key)
 	}
 }

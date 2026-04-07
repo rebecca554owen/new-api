@@ -49,6 +49,8 @@ const TokensTable = (tokensData) => {
     setEditingToken,
     setShowEdit,
     refresh,
+    isAdminUser,
+    isRootUser,
     t,
   } = tokensData;
 
@@ -67,6 +69,8 @@ const TokensTable = (tokensData) => {
       setEditingToken,
       setShowEdit,
       refresh,
+      isAdminUser,
+      isRootUser,
     });
   }, [
     t,
@@ -81,6 +85,8 @@ const TokensTable = (tokensData) => {
     setEditingToken,
     setShowEdit,
     refresh,
+    isAdminUser,
+    isRootUser,
   ]);
 
   // Handle compact mode by removing fixed positioning
