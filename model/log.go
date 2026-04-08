@@ -14,6 +14,7 @@ import (
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Log struct {
@@ -478,4 +479,97 @@ func DeleteOldLog(ctx context.Context, targetTimestamp int64, limit int) (int64,
 	}
 
 	return total, nil
+}
+
+func MigrateOldLogsToLogDBIfNeeded() error {
+	if !shouldMigrateOldLogsToLogDB() {
+		return nil
+	}
+	batchSize := getLogMigrationBatchSize()
+
+	var sourceCount int64
+	if err := DB.Model(&Log{}).Count(&sourceCount).Error; err != nil {
+		return err
+	}
+	if sourceCount == 0 {
+		return nil
+	}
+
+	var targetCount int64
+	if err := LOG_DB.Model(&Log{}).Count(&targetCount).Error; err != nil {
+		return err
+	}
+	if targetCount > 0 && !common.AllowLogMigrationToNonEmptyTarget {
+		return fmt.Errorf("log migration aborted: target log database is not empty")
+	}
+
+	common.SysLog(fmt.Sprintf("starting log migration: %d rows", sourceCount))
+
+	lastID := 0
+	var migrated int64
+	for {
+		var batch []Log
+		if err := DB.Where("id > ?", lastID).Order("id asc").Limit(batchSize).Find(&batch).Error; err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		if err := LOG_DB.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "id"}},
+			DoNothing: true,
+		}).CreateInBatches(batch, batchSize).Error; err != nil {
+			return err
+		}
+		lastID = batch[len(batch)-1].Id
+		migrated += int64(len(batch))
+	}
+
+	if err := syncLogIDSequence(LOG_DB); err != nil {
+		return err
+	}
+
+	var targetCountAfter int64
+	if err := LOG_DB.Model(&Log{}).Count(&targetCountAfter).Error; err != nil {
+		return err
+	}
+	if targetCountAfter < targetCount+sourceCount {
+		return fmt.Errorf("log migration verification failed: expected at least %d rows, got %d", targetCount+sourceCount, targetCountAfter)
+	}
+
+	if err := clearSourceLogs(); err != nil {
+		return err
+	}
+
+	common.SysLog(fmt.Sprintf("log migration completed: migrated %d rows", migrated))
+	return nil
+}
+
+func shouldMigrateOldLogsToLogDB() bool {
+	return common.AutoMigrateOldLogsToLogDB && DB != nil && LOG_DB != nil && DB != LOG_DB
+}
+
+func getLogMigrationBatchSize() int {
+	if common.LogMigrationBatchSize > 0 {
+		return common.LogMigrationBatchSize
+	}
+	return 1000
+}
+
+func clearSourceLogs() error {
+	switch {
+	case common.UsingPostgreSQL, common.UsingMySQL:
+		return DB.Exec("TRUNCATE TABLE logs").Error
+	default:
+		return DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&Log{}).Error
+	}
+}
+
+func syncLogIDSequence(db *gorm.DB) error {
+	switch common.LogSqlType {
+	case common.DatabaseTypePostgreSQL:
+		return db.Exec("SELECT setval(pg_get_serial_sequence('logs', 'id'), COALESCE((SELECT MAX(id) FROM logs), 1), (SELECT COUNT(*) > 0 FROM logs))").Error
+	default:
+		return nil
+	}
 }

@@ -82,6 +82,9 @@ func InitEnv() {
 	DebugEnabled = os.Getenv("DEBUG") == "true"
 	MemoryCacheEnabled = os.Getenv("MEMORY_CACHE_ENABLED") == "true"
 	IsMasterNode = os.Getenv("NODE_TYPE") != "slave"
+	AutoMigrateOldLogsToLogDB = GetEnvOrDefaultBool("AUTO_MIGRATE_OLD_LOGS_TO_LOG_DB", false)
+	LogMigrationBatchSize = GetEnvOrDefault("LOG_MIGRATION_BATCH_SIZE", 1000)
+	AllowLogMigrationToNonEmptyTarget = GetEnvOrDefaultBool("ALLOW_LOG_MIGRATION_TO_NON_EMPTY_TARGET", false)
 	TLSInsecureSkipVerify = GetEnvOrDefaultBool("TLS_INSECURE_SKIP_VERIFY", false)
 	if TLSInsecureSkipVerify {
 		if tr, ok := http.DefaultTransport.(*http.Transport); ok && tr != nil {
