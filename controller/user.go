@@ -13,7 +13,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
-	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
@@ -228,15 +227,11 @@ func Register(c *gin.Context) {
 
 func GetAllUsers(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.GetAllUsers(pageInfo)
+	pageInfo, err := adminListUsers(pageInfo)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-
-	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(users)
-
 	common.ApiSuccess(c, pageInfo)
 	return
 }
@@ -245,14 +240,11 @@ func SearchUsers(c *gin.Context) {
 	keyword := c.Query("keyword")
 	group := c.Query("group")
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.SearchUsers(keyword, group, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	pageInfo, err := adminSearchUsers(keyword, group, pageInfo)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-
-	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(users)
 	common.ApiSuccess(c, pageInfo)
 	return
 }
@@ -263,14 +255,14 @@ func GetUser(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	user, err := model.GetUserById(id, false)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
 	myRole := c.GetInt("role")
-	if myRole <= user.Role && myRole != common.RoleRootUser {
-		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionSameLevel)
+	user, err := adminGetUserByID(myRole, id)
+	if err != nil {
+		if errors.Is(err, errAdminPermissionSameLevel) {
+			common.ApiErrorI18n(c, i18n.MsgUserNoPermissionSameLevel)
+			return
+		}
+		common.ApiError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -538,16 +530,9 @@ func GetUserModels(c *gin.Context) {
 
 func UpdateUser(c *gin.Context) {
 	var updatedUser model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&updatedUser)
+	err := common.DecodeJson(c.Request.Body, &updatedUser)
 	if err != nil || updatedUser.Id == 0 {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
-		return
-	}
-	if updatedUser.Password == "" {
-		updatedUser.Password = "$I_LOVE_U" // make Validator happy :)
-	}
-	if err := common.Validate.Struct(&updatedUser); err != nil {
-		common.ApiErrorI18n(c, i18n.MsgUserInputInvalid, map[string]any{"Error": err.Error()})
 		return
 	}
 	originUser, err := model.GetUserById(updatedUser.Id, false)
@@ -564,16 +549,31 @@ func UpdateUser(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgUserCannotCreateHigherLevel)
 		return
 	}
-	if updatedUser.Password == "$I_LOVE_U" {
-		updatedUser.Password = "" // rollback to what it should be
+	updateInput := adminUpdateUserInput{ID: updatedUser.Id}
+	updateInput.Username = &updatedUser.Username
+	updateInput.DisplayName = &updatedUser.DisplayName
+	updateInput.Group = &updatedUser.Group
+	updateInput.Quota = &updatedUser.Quota
+	updateInput.Remark = &updatedUser.Remark
+	if updatedUser.Password != "" {
+		updateInput.Password = &updatedUser.Password
 	}
-	updatePassword := updatedUser.Password != ""
-	if err := updatedUser.Edit(updatePassword); err != nil {
+	_, err = adminUpdateUser(myRole, updateInput)
+	if err != nil {
+		if errors.Is(err, errAdminPermissionHigherLevel) {
+			common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
+			return
+		}
+		if errors.Is(err, errAdminInputInvalid) {
+			common.ApiErrorI18n(c, i18n.MsgUserInputInvalid, map[string]any{"Error": err.Error()})
+			return
+		}
+		if errors.Is(err, errAdminInvalidParams) {
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
 		common.ApiError(c, err)
 		return
-	}
-	if originUser.Quota != updatedUser.Quota {
-		model.RecordLog(originUser.Id, model.LogTypeManage, fmt.Sprintf("管理员将用户额度从 %s修改为 %s", logger.LogQuota(originUser.Quota), logger.LogQuota(updatedUser.Quota)))
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -758,24 +758,20 @@ func DeleteUser(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	originUser, err := model.GetUserById(id, false)
+	myRole := c.GetInt("role")
+	err = adminDeleteUser(myRole, id)
 	if err != nil {
+		if errors.Is(err, errAdminPermissionHigherLevel) {
+			common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
-	myRole := c.GetInt("role")
-	if myRole <= originUser.Role {
-		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
-		return
-	}
-	err = model.HardDeleteUserById(id)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"message": "",
-		})
-		return
-	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+	})
 }
 
 func DeleteSelf(c *gin.Context) {
@@ -801,7 +797,7 @@ func DeleteSelf(c *gin.Context) {
 
 func CreateUser(c *gin.Context) {
 	var user model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&user)
+	err := common.DecodeJson(c.Request.Body, &user)
 	user.Username = strings.TrimSpace(user.Username)
 	if err != nil || user.Username == "" || user.Password == "" {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
@@ -815,18 +811,25 @@ func CreateUser(c *gin.Context) {
 		user.DisplayName = user.Username
 	}
 	myRole := c.GetInt("role")
-	if user.Role >= myRole {
-		common.ApiErrorI18n(c, i18n.MsgUserCannotCreateHigherLevel)
-		return
-	}
-	// Even for admin users, we cannot fully trust them!
-	cleanUser := model.User{
+	_, err = adminCreateUser(myRole, adminCreateUserInput{
 		Username:    user.Username,
 		Password:    user.Password,
 		DisplayName: user.DisplayName,
-		Role:        user.Role, // 保持管理员设置的角色
-	}
-	if err := cleanUser.Insert(0); err != nil {
+		Role:        user.Role,
+	})
+	if err != nil {
+		if errors.Is(err, errAdminCreateHigherLevel) {
+			common.ApiErrorI18n(c, i18n.MsgUserCannotCreateHigherLevel)
+			return
+		}
+		if errors.Is(err, errAdminInputInvalid) {
+			common.ApiErrorI18n(c, i18n.MsgUserInputInvalid, map[string]any{"Error": err.Error()})
+			return
+		}
+		if errors.Is(err, errAdminInvalidParams) {
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
