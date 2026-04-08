@@ -63,9 +63,11 @@ const EditTokenModal = (props) => {
   const [models, setModels] = useState([]);
   const [groups, setGroups] = useState([]);
   const isEdit = props.editingToken.id !== undefined;
+  const isAdminUser = !!props.isAdminUser;
 
   const getInitValues = () => ({
     name: '',
+    user_id: undefined,
     remain_quota: 0,
     expired_time: -1,
     unlimited_quota: true,
@@ -127,6 +129,10 @@ const EditTokenModal = (props) => {
   };
 
   const loadGroups = async () => {
+    if (isAdminUser) {
+      setGroups([]);
+      return;
+    }
     let res = await API.get(`/api/user/self/groups`);
     const { success, message, data } = res.data;
     if (success) {
@@ -151,7 +157,11 @@ const EditTokenModal = (props) => {
 
   const loadToken = async () => {
     setLoading(true);
-    let res = await API.get(`/api/token/${props.editingToken.id}`);
+    let res = await API.get(
+      isAdminUser
+        ? `/api/token/admin/${props.editingToken.id}`
+        : `/api/token/${props.editingToken.id}`,
+    );
     const { success, message, data } = res.data;
     if (success) {
       if (data.expired_time !== -1) {
@@ -221,10 +231,13 @@ const EditTokenModal = (props) => {
       }
       localInputs.model_limits = localInputs.model_limits.join(',');
       localInputs.model_limits_enabled = localInputs.model_limits.length > 0;
-      let res = await API.put(`/api/token/`, {
-        ...localInputs,
-        id: parseInt(props.editingToken.id),
-      });
+      let res = await API.put(
+        isAdminUser ? `/api/token/admin/` : `/api/token/`,
+        {
+          ...localInputs,
+          id: parseInt(props.editingToken.id),
+        },
+      );
       const { success, message } = res.data;
       if (success) {
         showSuccess(t('令牌更新成功！'));
@@ -358,8 +371,22 @@ const EditTokenModal = (props) => {
                       showClear
                     />
                   </Col>
+                  {!isEdit && isAdminUser && (
+                    <Col span={24}>
+                      <Form.InputNumber
+                        field='user_id'
+                        label={t('用户ID')}
+                        placeholder={t('请输入目标用户ID')}
+                        min={1}
+                        rules={[
+                          { required: true, message: t('请输入目标用户ID') },
+                        ]}
+                        style={{ width: '100%' }}
+                      />
+                    </Col>
+                  )}
                   <Col span={24}>
-                    {groups.length > 0 ? (
+                    {!isAdminUser && groups.length > 0 ? (
                       <Form.Select
                         field='group'
                         label={t('令牌分组')}
@@ -376,6 +403,13 @@ const EditTokenModal = (props) => {
                         }}
                         showClear
                         style={{ width: '100%' }}
+                      />
+                    ) : isAdminUser ? (
+                      <Form.Input
+                        field='group'
+                        label={t('令牌分组')}
+                        placeholder={t('请输入令牌分组')}
+                        showClear
                       />
                     ) : (
                       <Form.Select
