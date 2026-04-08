@@ -477,6 +477,32 @@ func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
 	return increaseTokenQuota(tokenId, quota)
 }
 
+// GrantTokenRemainQuota is used by top-up flows to increase remain_quota only.
+func GrantTokenRemainQuota(tokenId int, key string, quota int) (err error) {
+	if quota < 0 {
+		return errors.New("quota 不能为负数！")
+	}
+	if common.RedisEnabled {
+		gopool.Go(func() {
+			err := cacheIncrTokenQuota(key, int64(quota))
+			if err != nil {
+				common.SysLog("failed to grant token remain quota: " + err.Error())
+			}
+			token, getErr := GetTokenById(tokenId)
+			if getErr != nil {
+				common.SysLog("failed to reload token after granting remain quota: " + getErr.Error())
+				return
+			}
+			if token.Status == common.TokenStatusEnabled {
+				setErr := cacheSetTokenField(key, "Status", fmt.Sprintf("%d", common.TokenStatusEnabled))
+				if setErr != nil {
+					common.SysLog("failed to restore token status cache after granting remain quota: " + setErr.Error())
+				}
+			}
+		})
+	}
+	return grantTokenRemainQuota(tokenId, quota)
+}
 func increaseTokenQuota(id int, quota int) (err error) {
 	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
 		map[string]interface{}{
@@ -488,6 +514,22 @@ func increaseTokenQuota(id int, quota int) (err error) {
 	return err
 }
 
+func grantTokenRemainQuota(id int, quota int) (err error) {
+	var token Token
+	err = DB.Select("id", "status").Where("id = ?", id).First(&token).Error
+	if err != nil {
+		return err
+	}
+	updates := map[string]interface{}{
+		"remain_quota":  gorm.Expr("remain_quota + ?", quota),
+		"accessed_time": common.GetTimestamp(),
+	}
+	if token.Status == common.TokenStatusExhausted {
+		updates["status"] = common.TokenStatusEnabled
+	}
+	err = DB.Model(&Token{}).Where("id = ?", id).Updates(updates).Error
+	return err
+}
 func DecreaseTokenQuota(id int, key string, quota int) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
