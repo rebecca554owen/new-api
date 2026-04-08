@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -14,6 +15,8 @@ import (
 type Token struct {
 	Id                 int            `json:"id"`
 	UserId             int            `json:"user_id" gorm:"index"`
+	Username           string         `json:"username,omitempty" gorm:"->"`
+	UserGroup          string         `json:"-" gorm:"->"`
 	Key                string         `json:"key" gorm:"type:char(48);uniqueIndex"`
 	Status             int            `json:"status" gorm:"default:1"`
 	Name               string         `json:"name" gorm:"index" `
@@ -124,7 +127,22 @@ func sanitizeLikePattern(input string) (string, error) {
 
 const searchHardLimit = 100
 
+func ensureTokenSearchCols() {
+	if commonKeyCol == "" || commonGroupCol == "" {
+		initCol()
+	}
+}
+
+func sanitizeAdminContainsPattern(input string) string {
+	input = strings.TrimSpace(input)
+	input = strings.ReplaceAll(input, "!", "!!")
+	input = strings.ReplaceAll(input, `%`, `!%`)
+	input = strings.ReplaceAll(input, `_`, `!_`)
+	return "%" + input + "%"
+}
+
 func SearchUserTokens(userId int, keyword string, token string, offset int, limit int) (tokens []*Token, total int64, err error) {
+	ensureTokenSearchCols()
 	// model 层强制截断
 	if limit <= 0 || limit > searchHardLimit {
 		limit = searchHardLimit
@@ -182,6 +200,73 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 		common.SysError("failed to search tokens: " + err.Error())
 		return nil, 0, errors.New("搜索令牌失败")
 	}
+	return tokens, total, nil
+}
+
+func SearchAdminTokens(keyword string, token string, username string, offset int, limit int) (tokens []*Token, total int64, err error) {
+	ensureTokenSearchCols()
+	if limit <= 0 || limit > searchHardLimit {
+		limit = searchHardLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	keyword = strings.TrimSpace(keyword)
+	token = strings.TrimSpace(strings.TrimPrefix(token, "sk-"))
+	username = strings.TrimSpace(username)
+
+	baseQuery := DB.Model(&Token{}).Joins("LEFT JOIN users ON users.id = tokens.user_id")
+
+	if keyword != "" {
+		keywordPattern := sanitizeAdminContainsPattern(keyword)
+		if userID, parseErr := strconv.Atoi(keyword); parseErr == nil {
+			baseQuery = baseQuery.Where(
+				"(tokens.name LIKE ? ESCAPE '!' OR users.username LIKE ? ESCAPE '!' OR tokens.user_id = ?)",
+				keywordPattern,
+				keywordPattern,
+				userID,
+			)
+		} else {
+			baseQuery = baseQuery.Where(
+				"(tokens.name LIKE ? ESCAPE '!' OR users.username LIKE ? ESCAPE '!')",
+				keywordPattern,
+				keywordPattern,
+			)
+		}
+	}
+	if token != "" {
+		tokenPattern := sanitizeAdminContainsPattern(token)
+		baseQuery = baseQuery.Where("tokens."+commonKeyCol+" LIKE ? ESCAPE '!'", tokenPattern)
+	}
+	if username != "" {
+		usernamePattern := sanitizeAdminContainsPattern(username)
+		baseQuery = baseQuery.Where("users.username LIKE ? ESCAPE '!'", usernamePattern)
+	}
+
+	err = baseQuery.Count(&total).Error
+	if err != nil {
+		common.SysError("failed to count admin search tokens: " + err.Error())
+		return nil, 0, errors.New("搜索令牌失败")
+	}
+
+	err = baseQuery.
+		Select("tokens.*, users.username as username, users." + commonGroupCol + " as user_group").
+		Order("tokens.id desc").
+		Offset(offset).
+		Limit(limit).
+		Find(&tokens).Error
+	if err != nil {
+		common.SysError("failed to search admin tokens: " + err.Error())
+		return nil, 0, errors.New("搜索令牌失败")
+	}
+
+	for _, tokenItem := range tokens {
+		if tokenItem.Group == "" {
+			tokenItem.Group = tokenItem.UserGroup
+		}
+	}
+
 	return tokens, total, nil
 }
 
@@ -262,6 +347,7 @@ func GetTokenById(id int) (*Token, error) {
 }
 
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
+	ensureTokenSearchCols()
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
 		if shouldUpdateRedis(fromDB, err) && token != nil {
@@ -448,6 +534,39 @@ func CountUserTokens(userId int) (int64, error) {
 	return total, err
 }
 
+func BatchDeleteTokensByIds(ids []int) (int, error) {
+	if len(ids) == 0 {
+		return 0, errors.New("ids 不能为空！")
+	}
+
+	tx := DB.Begin()
+
+	var tokens []Token
+	if err := tx.Where("id IN (?)", ids).Find(&tokens).Error; err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+
+	if err := tx.Where("id IN (?)", ids).Delete(&Token{}).Error; err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return 0, err
+	}
+
+	if common.RedisEnabled {
+		gopool.Go(func() {
+			for _, t := range tokens {
+				_ = cacheDeleteToken(t.Key)
+			}
+		})
+	}
+
+	return len(tokens), nil
+}
+
 // BatchDeleteTokens 删除指定用户的一组令牌，返回成功删除数量
 func BatchDeleteTokens(ids []int, userId int) (int, error) {
 	if len(ids) == 0 {
@@ -483,9 +602,19 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 }
 
 func GetTokenKeysByIds(ids []int, userId int) ([]Token, error) {
+	ensureTokenSearchCols()
 	var tokens []Token
 	err := DB.Select("id", commonKeyCol).
 		Where("user_id = ? AND id IN (?)", userId, ids).
+		Find(&tokens).Error
+	return tokens, err
+}
+
+func GetTokenKeysByIdsForAdmin(ids []int) ([]Token, error) {
+	ensureTokenSearchCols()
+	var tokens []Token
+	err := DB.Select("id", commonKeyCol).
+		Where("id IN (?)", ids).
 		Find(&tokens).Error
 	return tokens, err
 }
