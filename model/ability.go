@@ -103,12 +103,16 @@ func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
 	return channelQuery, nil
 }
 
-func GetChannel(group string, model string, retry int, preferredChannelTypes []int) (*Channel, error) {
+func GetChannel(group string, model string, retry int, preferredChannelTypes []int, excludedChannelIds []int) (*Channel, error) {
 	var abilities []Ability
 
 	channelQuery, err := getChannelQuery(group, model, retry)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(excludedChannelIds) > 0 {
+		channelQuery = channelQuery.Where("channel_id NOT IN ?", excludedChannelIds)
 	}
 
 	orderClause := "weight DESC"
