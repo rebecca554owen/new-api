@@ -284,10 +284,7 @@ func InitResources() error {
 	if err != nil {
 		return err
 	}
-	err = model.MigrateOldLogsToLogDBIfNeeded()
-	if err != nil {
-		return err
-	}
+	model.MigrateOldLogsToLogDBIfNeeded()
 
 	// Initialize Redis
 	err = common.InitRedisClient()

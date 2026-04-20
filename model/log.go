@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -16,6 +17,8 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+var logMigrationOnce sync.Once
 
 type Log struct {
 	Id               int    `json:"id" gorm:"index:idx_created_at_id,priority:1;index:idx_user_id_id,priority:2"`
@@ -481,10 +484,20 @@ func DeleteOldLog(ctx context.Context, targetTimestamp int64, limit int) (int64,
 	return total, nil
 }
 
-func MigrateOldLogsToLogDBIfNeeded() error {
+func MigrateOldLogsToLogDBIfNeeded() {
 	if !shouldMigrateOldLogsToLogDB() {
-		return nil
+		return
 	}
+	logMigrationOnce.Do(func() {
+		gopool.Go(func() {
+			if err := migrateOldLogsToLogDB(); err != nil {
+				common.SysError("log migration failed: " + err.Error())
+			}
+		})
+	})
+}
+
+func migrateOldLogsToLogDB() error {
 	batchSize := getLogMigrationBatchSize()
 
 	var sourceCount int64
@@ -523,6 +536,7 @@ func MigrateOldLogsToLogDBIfNeeded() error {
 		}
 		lastID = batch[len(batch)-1].Id
 		migrated += int64(len(batch))
+		common.SysLog(fmt.Sprintf("log migration progress: %d/%d rows", migrated, sourceCount))
 	}
 
 	if err := syncLogIDSequence(LOG_DB); err != nil {

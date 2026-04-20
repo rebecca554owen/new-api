@@ -77,7 +77,7 @@ func TestMigrateOldLogsToLogDBIfNeeded(t *testing.T) {
 		t.Fatalf("failed to seed source logs: %v", err)
 	}
 
-	if err := MigrateOldLogsToLogDBIfNeeded(); err != nil {
+	if err := migrateOldLogsToLogDB(); err != nil {
 		t.Fatalf("failed to auto migrate logs: %v", err)
 	}
 
