@@ -179,10 +179,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}()
 
 	retryParam := &service.RetryParam{
-		Ctx:        c,
-		TokenGroup: relayInfo.TokenGroup,
-		ModelName:  relayInfo.OriginModelName,
-		Retry:      common.GetPointer(0),
+		Ctx:                   c,
+		TokenGroup:            relayInfo.TokenGroup,
+		ModelName:             relayInfo.OriginModelName,
+		Retry:                 common.GetPointer(0),
+		PreferredChannelTypes: types.RelayFormatToPreferredChannelTypes(relayInfo.RelayFormat),
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
@@ -229,6 +230,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.LastError = newAPIError
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+
+		retryParam.ExcludedChannelIds = append(retryParam.ExcludedChannelIds, channel.Id)
 
 		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
 			break
