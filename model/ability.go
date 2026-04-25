@@ -105,23 +105,38 @@ func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
 	return channelQuery, nil
 }
 
-func GetChannel(group string, model string, retry int, requestPath string) (*Channel, error) {
+func GetChannel(group string, model string, retry int, requestPath string, preferredChannelTypes []int, excludedChannelIds []int) (*Channel, error) {
 	var abilities []Ability
 
-	var err error = nil
 	channelQuery, err := getChannelQuery(group, model, retry)
 	if err != nil {
 		return nil, err
 	}
-	if common.UsingMainDatabase(common.DatabaseTypeSQLite) || common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		err = channelQuery.Order("weight DESC").Find(&abilities).Error
-	} else {
-		err = channelQuery.Order("weight DESC").Find(&abilities).Error
+
+	if len(excludedChannelIds) > 0 {
+		channelQuery = channelQuery.Where("channel_id NOT IN ?", excludedChannelIds)
 	}
-	if err != nil {
-		return nil, err
+
+	orderClause := "weight DESC"
+
+	// Try with preferred channel types filter first
+	if len(preferredChannelTypes) > 0 {
+		subQuery := DB.Model(&Channel{}).Select("id").Where("type IN ?", preferredChannelTypes)
+		err = channelQuery.Where("channel_id IN (?)", subQuery).Order(orderClause).Find(&abilities).Error
+		if err != nil {
+			return nil, err
+		}
+		abilities = filterAbilitiesByRequestPathAndModel(abilities, requestPath, model)
 	}
-	abilities = filterAbilitiesByRequestPathAndModel(abilities, requestPath, model)
+
+	// If no abilities found with filter, try without filter
+	if len(abilities) == 0 {
+		err = channelQuery.Order(orderClause).Find(&abilities).Error
+		if err != nil {
+			return nil, err
+		}
+		abilities = filterAbilitiesByRequestPathAndModel(abilities, requestPath, model)
+	}
 	channel := Channel{}
 	if len(abilities) > 0 {
 		// Randomly choose one
