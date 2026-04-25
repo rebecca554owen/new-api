@@ -302,15 +302,13 @@ func Register(c *gin.Context) {
 
 func GetAllUsers(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.GetAllUsers(pageInfo)
+	users, total, err := model.GetAllUsers(pageInfo, c.Query("order"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(users)
-
 	common.ApiSuccess(c, pageInfo)
 	return
 }
@@ -331,12 +329,11 @@ func SearchUsers(c *gin.Context) {
 		}
 	}
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.SearchUsers(keyword, group, role, status, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	users, total, err := model.SearchUsers(keyword, group, role, status, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), c.Query("order"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(users)
 	common.ApiSuccess(c, pageInfo)
@@ -664,7 +661,7 @@ func UpdateUser(c *gin.Context) {
 		return
 	}
 	if updatedUser.Password == "" {
-		updatedUser.Password = "$I_LOVE_U" // make Validator happy :)
+		updatedUser.Password = "$I_LOVE_U"
 	}
 	if err := common.Validate.Struct(&updatedUser); err != nil {
 		common.ApiErrorI18n(c, i18n.MsgUserInputInvalid, map[string]any{"Error": err.Error()})
@@ -686,7 +683,7 @@ func UpdateUser(c *gin.Context) {
 		return
 	}
 	if updatedUser.Password == "$I_LOVE_U" {
-		updatedUser.Password = "" // rollback to what it should be
+		updatedUser.Password = ""
 	}
 	updatePassword := updatedUser.Password != ""
 	authzTouched := false
@@ -972,12 +969,11 @@ func CreateUser(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgUserCannotCreateHigherLevel)
 		return
 	}
-	// Even for admin users, we cannot fully trust them!
 	cleanUser := model.User{
 		Username:    user.Username,
 		Password:    user.Password,
 		DisplayName: user.DisplayName,
-		Role:        user.Role, // 保持管理员设置的角色
+		Role:        user.Role,
 	}
 	authzTouched := false
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
