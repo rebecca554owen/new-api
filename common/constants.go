@@ -113,6 +113,9 @@ var DebugEnabled bool
 var MemoryCacheEnabled bool
 
 var LogConsumeEnabled = true
+var AutoMigrateOldLogsToLogDB bool
+var LogMigrationBatchSize int
+var AllowLogMigrationToNonEmptyTarget bool
 
 var TLSInsecureSkipVerify bool
 var InsecureTLSConfig = &tls.Config{InsecureSkipVerify: true}
