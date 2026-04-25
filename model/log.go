@@ -4,16 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/types"
 
+	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func applyExplicitLogTextFilter(tx *gorm.DB, column string, value string) (*gorm.DB, error) {
@@ -54,6 +58,30 @@ func sanitizeClickHouseLikePattern(input string) (string, error) {
 		return "", err
 	}
 	return input, nil
+}
+
+var logMigrationOnce sync.Once
+
+type logMigrationStage string
+
+const (
+	logMigrationStageIdle      logMigrationStage = "idle"
+	logMigrationStageStarted   logMigrationStage = "started"
+	logMigrationStageCopied    logMigrationStage = "copied"
+	logMigrationStageVerified  logMigrationStage = "verified"
+	logMigrationStageCleared   logMigrationStage = "cleared"
+	logMigrationStageCompleted logMigrationStage = "completed"
+	logMigrationStageFailed    logMigrationStage = "failed"
+)
+
+var logMigrationState = struct {
+	sync.Mutex
+	Stage       logMigrationStage
+	SourceCount int64
+	MaxID       int
+	Migrated    int64
+}{
+	Stage: logMigrationStageIdle,
 }
 
 type Log struct {
@@ -833,4 +861,227 @@ func DeleteOldLog(ctx context.Context, targetTimestamp int64, limit int) (int64,
 	}
 
 	return total, nil
+}
+
+func MigrateOldLogsToLogDBIfNeeded() {
+	if !shouldMigrateOldLogsToLogDB() {
+		return
+	}
+	logMigrationOnce.Do(func() {
+		gopool.Go(func() {
+			if err := migrateOldLogsToLogDB(); err != nil {
+				setLogMigrationState(logMigrationStageFailed, 0, 0, 0)
+				common.SysError("log migration failed: " + err.Error())
+			}
+		})
+	})
+}
+
+func migrateOldLogsToLogDB() error {
+	sourceDB, sourceType, cleanup, err := getOldLogMigrationSource()
+	if err != nil {
+		return err
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	return migrateLogsBetweenDBs(sourceDB, sourceType, LOG_DB, common.LogDatabaseType())
+}
+
+func getOldLogMigrationSource() (*gorm.DB, common.DatabaseType, func(), error) {
+	if common.OldLogSqlDsn == "" {
+		return DB, common.MainDatabaseType(), nil, nil
+	}
+	if common.OldLogSqlDsn == os.Getenv("LOG_SQL_DSN") {
+		return nil, "", nil, fmt.Errorf("old log migration aborted: OLD_LOG_SQL_DSN must not equal LOG_SQL_DSN")
+	}
+	oldLogDB, oldLogType, err := openLogMigrationSourceDB(common.OldLogSqlDsn)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	if oldLogType == common.DatabaseTypeClickHouse {
+		if sqlDB, closeErr := oldLogDB.DB(); closeErr == nil {
+			_ = sqlDB.Close()
+		}
+		return nil, "", nil, fmt.Errorf("old log migration aborted: ClickHouse is not supported as OLD_LOG_SQL_DSN source")
+	}
+	cleanup := func() {
+		if sqlDB, closeErr := oldLogDB.DB(); closeErr == nil {
+			_ = sqlDB.Close()
+		}
+	}
+	return oldLogDB, oldLogType, cleanup, nil
+}
+
+func openLogMigrationSourceDB(dsn string) (*gorm.DB, common.DatabaseType, error) {
+	previous, hadPrevious := os.LookupEnv("OLD_LOG_SQL_DSN")
+	if err := os.Setenv("OLD_LOG_SQL_DSN", dsn); err != nil {
+		return nil, "", err
+	}
+	defer func() {
+		if hadPrevious {
+			_ = os.Setenv("OLD_LOG_SQL_DSN", previous)
+		} else {
+			_ = os.Unsetenv("OLD_LOG_SQL_DSN")
+		}
+	}()
+	return chooseDB("OLD_LOG_SQL_DSN", true)
+}
+
+func migrateLogsBetweenDBs(sourceDB *gorm.DB, sourceType common.DatabaseType, targetDB *gorm.DB, targetType common.DatabaseType) error {
+	batchSize := getLogMigrationBatchSize()
+
+	var sourceCount int64
+	if err := sourceDB.Model(&Log{}).Count(&sourceCount).Error; err != nil {
+		return err
+	}
+	if sourceCount == 0 {
+		setLogMigrationState(logMigrationStageCompleted, 0, 0, 0)
+		return nil
+	}
+	var maxLog Log
+	if err := sourceDB.Select("id").Order("id desc").First(&maxLog).Error; err != nil {
+		return err
+	}
+
+	var targetCount int64
+	if err := targetDB.Model(&Log{}).Count(&targetCount).Error; err != nil {
+		return err
+	}
+	if targetCount > 0 && !common.AllowLogMigrationToNonEmptyTarget {
+		return fmt.Errorf("log migration aborted: target log database is not empty")
+	}
+
+	setLogMigrationState(logMigrationStageStarted, sourceCount, maxLog.Id, 0)
+	common.SysLog(fmt.Sprintf("starting log migration: %d rows, max_id=%d, batch_size=%d", sourceCount, maxLog.Id, batchSize))
+
+	lastID := 0
+	var migrated int64
+	lastProgressAt := time.Now()
+	lastProgressRows := int64(0)
+	for {
+		var batch []Log
+		if err := sourceDB.Where("id > ? AND id <= ?", lastID, maxLog.Id).Order("id asc").Limit(batchSize).Find(&batch).Error; err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		if err := createMigratedLogBatch(targetDB, targetType, batch, batchSize); err != nil {
+			return err
+		}
+		lastID = batch[len(batch)-1].Id
+		migrated += int64(len(batch))
+		setLogMigrationState(logMigrationStageStarted, sourceCount, maxLog.Id, migrated)
+		if migrated-lastProgressRows >= int64(batchSize) || time.Since(lastProgressAt) >= 10*time.Second {
+			common.SysLog(fmt.Sprintf("log migration progress: %d/%d rows", migrated, sourceCount))
+			lastProgressAt = time.Now()
+			lastProgressRows = migrated
+		}
+	}
+	setLogMigrationState(logMigrationStageCopied, sourceCount, maxLog.Id, migrated)
+	common.SysLog(fmt.Sprintf("log migration copy completed: %d/%d rows", migrated, sourceCount))
+
+	if err := syncLogIDSequence(targetDB, targetType); err != nil {
+		return err
+	}
+
+	if err := verifyMigratedLogs(sourceDB, targetDB, maxLog.Id, batchSize); err != nil {
+		return err
+	}
+	setLogMigrationState(logMigrationStageVerified, sourceCount, maxLog.Id, migrated)
+
+	if err := clearSourceLogs(sourceDB, sourceType); err != nil {
+		return err
+	}
+	setLogMigrationState(logMigrationStageCleared, sourceCount, maxLog.Id, migrated)
+	common.SysLog(fmt.Sprintf("log migration source cleanup completed: cleared %d rows", sourceCount))
+
+	var sourceCountAfter int64
+	if err := sourceDB.Model(&Log{}).Count(&sourceCountAfter).Error; err != nil {
+		return err
+	}
+	if sourceCountAfter != 0 {
+		return fmt.Errorf("log migration cleanup failed: source log table still has %d rows", sourceCountAfter)
+	}
+
+	setLogMigrationState(logMigrationStageCompleted, sourceCount, maxLog.Id, migrated)
+	common.SysLog(fmt.Sprintf("log migration completed: migrated %d rows", migrated))
+	return nil
+}
+
+func createMigratedLogBatch(targetDB *gorm.DB, targetType common.DatabaseType, batch []Log, batchSize int) error {
+	if targetType == common.DatabaseTypeClickHouse {
+		for i := range batch {
+			ensureLogRequestId(&batch[i])
+		}
+		return targetDB.CreateInBatches(batch, batchSize).Error
+	}
+	return targetDB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoNothing: true,
+	}).CreateInBatches(batch, batchSize).Error
+}
+
+func setLogMigrationState(stage logMigrationStage, sourceCount int64, maxID int, migrated int64) {
+	logMigrationState.Lock()
+	defer logMigrationState.Unlock()
+	logMigrationState.Stage = stage
+	logMigrationState.SourceCount = sourceCount
+	logMigrationState.MaxID = maxID
+	logMigrationState.Migrated = migrated
+}
+
+func verifyMigratedLogs(sourceDB *gorm.DB, targetDB *gorm.DB, maxID int, batchSize int) error {
+	lastID := 0
+	for {
+		var ids []int
+		if err := sourceDB.Model(&Log{}).
+			Where("id > ? AND id <= ?", lastID, maxID).
+			Order("id asc").
+			Limit(batchSize).
+			Pluck("id", &ids).Error; err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		var targetCount int64
+		if err := targetDB.Model(&Log{}).Where("id IN ?", ids).Count(&targetCount).Error; err != nil {
+			return err
+		}
+		if targetCount != int64(len(ids)) {
+			return fmt.Errorf("log migration verification failed: expected %d rows for id range %d-%d, got %d", len(ids), ids[0], ids[len(ids)-1], targetCount)
+		}
+		lastID = ids[len(ids)-1]
+	}
+}
+
+func shouldMigrateOldLogsToLogDB() bool {
+	return common.AutoMigrateOldLogsToLogDB && DB != nil && LOG_DB != nil && (DB != LOG_DB || common.OldLogSqlDsn != "")
+}
+
+func getLogMigrationBatchSize() int {
+	if common.LogMigrationBatchSize > 0 {
+		return common.LogMigrationBatchSize
+	}
+	return 10000
+}
+
+func clearSourceLogs(sourceDB *gorm.DB, sourceType common.DatabaseType) error {
+	switch sourceType {
+	case common.DatabaseTypePostgreSQL, common.DatabaseTypeMySQL:
+		return sourceDB.Exec("TRUNCATE TABLE logs").Error
+	default:
+		return sourceDB.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&Log{}).Error
+	}
+}
+
+func syncLogIDSequence(db *gorm.DB, dbType common.DatabaseType) error {
+	switch dbType {
+	case common.DatabaseTypePostgreSQL:
+		return db.Exec("SELECT setval(pg_get_serial_sequence('logs', 'id'), COALESCE((SELECT MAX(id) FROM logs), 1), (SELECT COUNT(*) > 0 FROM logs))").Error
+	default:
+		return nil
+	}
 }
