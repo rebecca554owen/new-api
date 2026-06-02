@@ -45,7 +45,19 @@ func InternalAdminListUsers(c *gin.Context) {
 
 func InternalAdminSearchUsers(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.SearchUsers(c.Query("keyword"), c.Query("group"), pageInfo.GetStartIdx(), pageInfo.GetPageSize(), c.Query("order"))
+	var role *int
+	if roleStr := c.Query("role"); roleStr != "" {
+		if parsed, err := strconv.Atoi(roleStr); err == nil {
+			role = &parsed
+		}
+	}
+	var status *int
+	if statusStr := c.Query("status"); statusStr != "" {
+		if parsed, err := strconv.Atoi(statusStr); err == nil {
+			status = &parsed
+		}
+	}
+	users, total, err := model.SearchUsers(c.Query("keyword"), c.Query("group"), role, status, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 	if err != nil {
 		common.ApiError(c, err)
 		return

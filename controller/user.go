@@ -797,10 +797,6 @@ func DeleteUser(c *gin.Context) {
 		"success": true,
 		"message": "",
 	})
-<<<<<<< HEAD
-	return
-=======
->>>>>>> 6e4f1aa2 (feat: 支持管理员和 internal-admin 管理用户令牌)
 }
 
 func DeleteSelf(c *gin.Context) {
