@@ -10,6 +10,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const tokenLogMaxPageSize = 1000
+
 func GetAllLogs(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
 	logType, _ := strconv.Atoi(c.Query("type"))
@@ -80,6 +82,22 @@ func GetLogByKey(c *gin.Context) {
 		})
 		return
 	}
+
+	if hasTokenLogPageQuery(c) {
+		pageInfo := getTokenLogPageQuery(c)
+		startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
+		endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
+		logs, total, err := model.GetLogByTokenIdPage(tokenId, startTimestamp, endTimestamp, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		pageInfo.SetTotal(int(total))
+		pageInfo.SetItems(logs)
+		common.ApiSuccess(c, pageInfo)
+		return
+	}
+
 	logs, err := model.GetLogByTokenId(tokenId)
 	if err != nil {
 		c.JSON(200, gin.H{
@@ -93,6 +111,42 @@ func GetLogByKey(c *gin.Context) {
 		"message": "",
 		"data":    logs,
 	})
+}
+
+func hasTokenLogPageQuery(c *gin.Context) bool {
+	return c.Query("p") != "" ||
+		c.Query("page_size") != "" ||
+		c.Query("ps") != "" ||
+		c.Query("size") != "" ||
+		c.Query("start_timestamp") != "" ||
+		c.Query("end_timestamp") != ""
+}
+
+func getTokenLogPageQuery(c *gin.Context) *common.PageInfo {
+	pageInfo := common.GetPageQuery(c)
+	if pageInfo.Page < 1 {
+		pageInfo.Page = 1
+	}
+	requestedPageSize := getTokenLogPageSize(c)
+	if requestedPageSize > pageInfo.PageSize {
+		pageInfo.PageSize = requestedPageSize
+	}
+	if pageInfo.PageSize < 1 {
+		pageInfo.PageSize = common.ItemsPerPage
+	}
+	if pageInfo.PageSize > tokenLogMaxPageSize {
+		pageInfo.PageSize = tokenLogMaxPageSize
+	}
+	return pageInfo
+}
+
+func getTokenLogPageSize(c *gin.Context) int {
+	for _, key := range []string{"page_size", "ps", "size"} {
+		if pageSize, err := strconv.Atoi(c.Query(key)); err == nil && pageSize > 0 {
+			return pageSize
+		}
+	}
+	return 0
 }
 
 func GetLogsStat(c *gin.Context) {
