@@ -24,6 +24,7 @@ import (
 const (
 	InitialScannerBufferSize    = 64 << 10 // 64KB (64*1024)
 	DefaultMaxScannerBufferSize = 64 << 20 // 64MB (64*1024*1024) default SSE buffer size
+	DefaultStreamingTimeout     = 300 * time.Second
 	DefaultPingInterval         = 10 * time.Second
 )
 
@@ -45,32 +46,52 @@ func getScannerBufferSize() int {
 	return DefaultMaxScannerBufferSize
 }
 
+func getStreamingTimeout() time.Duration {
+	if constant.StreamingTimeout > 0 {
+		return time.Duration(constant.StreamingTimeout) * time.Second
+	}
+	return DefaultStreamingTimeout
+}
+
+func NewStreamScanner(reader io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, InitialScannerBufferSize), getScannerBufferSize())
+	return scanner
+}
+
 func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
 
 	if resp == nil || dataHandler == nil {
 		return
 	}
+	if resp.Body == nil {
+		return
+	}
 
-	// 无条件新建 StreamStatus
+	previousStreamStatus := info.StreamStatus
 	info.StreamStatus = relaycommon.NewStreamStatus()
+	info.StreamStatus.CopyErrorsFrom(previousStreamStatus)
 
-	// 确保响应体总是被关闭
-	defer func() {
-		if resp.Body != nil {
-			resp.Body.Close()
-		}
-	}()
+	var closeRespBodyOnce sync.Once
+	closeRespBody := func() {
+		closeRespBodyOnce.Do(func() {
+			_ = resp.Body.Close()
+		})
+	}
 
-	streamingTimeout := time.Duration(constant.StreamingTimeout) * time.Second
+	streamingTimeout := getStreamingTimeout()
 
 	var (
 		stopChan   = make(chan bool, 3) // 增加缓冲区避免阻塞
-		scanner    = bufio.NewScanner(resp.Body)
+		scanner    = NewStreamScanner(resp.Body)
 		ticker     = time.NewTicker(streamingTimeout)
 		pingTicker *time.Ticker
 		writeMutex sync.Mutex     // Mutex to protect concurrent writes
 		wg         sync.WaitGroup // 用于等待所有 goroutine 退出
 	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx = context.WithValue(ctx, "stop_chan", stopChan)
 
 	generalSettings := operation_setting.GetGeneralSetting()
 	pingEnabled := generalSettings.PingIntervalEnabled && !info.DisablePing
@@ -94,8 +115,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 	// 改进资源清理，确保所有 goroutine 正确退出
 	defer func() {
-		// 通知所有 goroutine 停止
+		cancel()
 		common.SafeSendBool(stopChan, true)
+		closeRespBody()
 
 		ticker.Stop()
 		if pingTicker != nil {
@@ -118,14 +140,8 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		close(stopChan)
 	}()
 
-	scanner.Buffer(make([]byte, InitialScannerBufferSize), getScannerBufferSize())
 	scanner.Split(bufio.ScanLines)
 	SetEventStreamHeaders(c)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	ctx = context.WithValue(ctx, "stop_chan", stopChan)
 
 	// Handle ping data sending with improved error handling
 	if pingEnabled && pingTicker != nil {
@@ -242,6 +258,8 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				return
 			case <-c.Request.Context().Done():
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+				cancel()
+				closeRespBody()
 				return
 			default:
 			}
@@ -282,6 +300,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 		if err := scanner.Err(); err != nil {
 			if err != io.EOF {
+				if isExpectedStreamCloseError(err) && (info.StreamStatus.IsAbortLikeEnd() || ctx.Err() != nil) {
+					return
+				}
 				logger.LogError(c, "scanner error: "+err.Error())
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
 			}
@@ -293,10 +314,14 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	select {
 	case <-ticker.C:
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+		cancel()
+		closeRespBody()
 	case <-stopChan:
 		// EndReason already set by the goroutine that triggered stopChan
 	case <-c.Request.Context().Done():
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+		cancel()
+		closeRespBody()
 	}
 
 	if info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
@@ -304,4 +329,14 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	} else {
 		logger.LogError(c, fmt.Sprintf("stream ended: %s, received=%d", info.StreamStatus.Summary(), info.ReceivedResponseCount))
 	}
+}
+
+func isExpectedStreamCloseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "context canceled") ||
+		strings.Contains(msg, "read on closed response body")
 }

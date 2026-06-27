@@ -1,11 +1,15 @@
 package claude
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -376,6 +380,14 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 								Text: common.GetPointer[string](mediaMessage.Text),
 							})
 						}
+					case "file":
+						claudeMediaMessage, ok, err := convertOpenAIFileToClaudeContent(c, mediaMessage)
+						if err != nil {
+							return nil, err
+						}
+						if ok {
+							claudeMediaMessages = append(claudeMediaMessages, claudeMediaMessage)
+						}
 					default:
 						source := mediaMessage.ToFileSource()
 						if source == nil {
@@ -392,8 +404,10 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 						}
 						if strings.HasPrefix(mimeType, "application/pdf") {
 							claudeMediaMessage.Type = "document"
-						} else {
+						} else if strings.HasPrefix(mimeType, "image/") {
 							claudeMediaMessage.Type = "image"
+						} else {
+							continue
 						}
 
 						claudeMediaMessage.Source.MediaType = mimeType
@@ -406,9 +420,10 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 				if message.ToolCalls != nil {
 					for _, toolCall := range message.ParseToolCalls() {
 						inputObj := make(map[string]any)
-						if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &inputObj); err != nil {
-							common.SysLog("tool call function arguments is not a map[string]any: " + fmt.Sprintf("%v", toolCall.Function.Arguments))
-							continue
+						if args := toolCall.Function.Arguments; args != "" {
+							if err := json.Unmarshal([]byte(args), &inputObj); err != nil {
+								common.SysLog("tool call function arguments is not a map[string]any: " + fmt.Sprintf("%v", toolCall.Function.Arguments))
+							}
 						}
 						claudeMediaMessages = append(claudeMediaMessages, dto.ClaudeMediaMessage{
 							Type:  "tool_use",
@@ -434,6 +449,86 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 	return &claudeRequest, nil
 }
 
+func convertOpenAIFileToClaudeContent(c *gin.Context, mediaMessage dto.MediaContent) (dto.ClaudeMediaMessage, bool, error) {
+	file := mediaMessage.GetFile()
+	if file == nil || file.FileData == "" {
+		return dto.ClaudeMediaMessage{}, false, nil
+	}
+
+	mimeType := inferClaudeFileMimeType(file.FileName)
+	if mimeType == "" {
+		return dto.ClaudeMediaMessage{}, false, nil
+	}
+
+	source := types.NewFileSourceFromData(file.FileData, mimeType)
+	base64Data, loadedMimeType, err := service.GetBase64Data(c, source, "formatting file for Claude")
+	if err != nil {
+		return dto.ClaudeMediaMessage{}, false, fmt.Errorf("get file data failed: %s", err.Error())
+	}
+	if loadedMimeType != "" {
+		mimeType = normalizeClaudeMimeType(loadedMimeType)
+	}
+
+	if strings.HasPrefix(mimeType, "application/pdf") {
+		return dto.ClaudeMediaMessage{
+			Type: "document",
+			Source: &dto.ClaudeMessageSource{
+				Type:      "base64",
+				MediaType: mimeType,
+				Data:      base64Data,
+			},
+		}, true, nil
+	}
+
+	if isClaudeTextFileMimeType(mimeType) {
+		decoded, err := base64.StdEncoding.DecodeString(base64Data)
+		if err != nil {
+			return dto.ClaudeMediaMessage{}, false, fmt.Errorf("decode text file failed: %s", err.Error())
+		}
+		if !utf8.Valid(decoded) {
+			return dto.ClaudeMediaMessage{}, false, nil
+		}
+		return dto.ClaudeMediaMessage{
+			Type: "text",
+			Text: common.GetPointer[string](string(decoded)),
+		}, true, nil
+	}
+
+	return dto.ClaudeMediaMessage{}, false, nil
+}
+
+func inferClaudeFileMimeType(fileName string) string {
+	ext := strings.ToLower(filepath.Ext(fileName))
+	if ext == "" {
+		return ""
+	}
+	switch ext {
+	case ".pdf":
+		return "application/pdf"
+	case ".txt", ".md", ".markdown", ".csv", ".tsv", ".log":
+		return "text/plain"
+	case ".json":
+		return "application/json"
+	}
+	return normalizeClaudeMimeType(mime.TypeByExtension(ext))
+}
+
+func normalizeClaudeMimeType(mimeType string) string {
+	if mimeType == "" {
+		return ""
+	}
+	return strings.TrimSpace(strings.ToLower(strings.Split(mimeType, ";")[0]))
+}
+
+func isClaudeTextFileMimeType(mimeType string) bool {
+	mimeType = normalizeClaudeMimeType(mimeType)
+	return strings.HasPrefix(mimeType, "text/") ||
+		mimeType == "application/json" ||
+		mimeType == "application/xml" ||
+		mimeType == "application/yaml" ||
+		mimeType == "application/x-yaml"
+}
+
 func StreamResponseClaude2OpenAI(claudeResponse *dto.ClaudeResponse) *dto.ChatCompletionsStreamResponse {
 	var response dto.ChatCompletionsStreamResponse
 	response.Object = "chat.completion.chunk"
@@ -442,10 +537,7 @@ func StreamResponseClaude2OpenAI(claudeResponse *dto.ClaudeResponse) *dto.ChatCo
 	tools := make([]dto.ToolCallResponse, 0)
 	fcIdx := 0
 	if claudeResponse.Index != nil {
-		fcIdx = *claudeResponse.Index - 1
-		if fcIdx < 0 {
-			fcIdx = 0
-		}
+		fcIdx = *claudeResponse.Index
 	}
 	var choice dto.ChatCompletionsStreamResponseChoice
 	if claudeResponse.Type == "message_start" {
@@ -567,12 +659,14 @@ func ResponseClaude2OpenAI(claudeResponse *dto.ClaudeResponse) *dto.OpenAITextRe
 	}
 	choice.SetStringContent(responseText)
 	if len(responseThinking) > 0 {
-		choice.ReasoningContent = responseThinking
+		choice.ReasoningContent = &responseThinking
 	}
 	if len(tools) > 0 {
 		choice.Message.SetToolCalls(tools)
 	}
-	choice.Message.ReasoningContent = thinkingContent
+	if thinkingContent != "" {
+		choice.Message.ReasoningContent = &thinkingContent
+	}
 	fullTextResponse.Model = claudeResponse.Model
 	choices = append(choices, choice)
 	fullTextResponse.Choices = choices
