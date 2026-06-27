@@ -187,13 +187,9 @@ func InitDB() (err error) {
 				panic(err)
 			}
 		}
-		sqlDB, err := DB.DB()
-		if err != nil {
+		if err := configureSQLConnectionPool(DB, ""); err != nil {
 			return err
 		}
-		sqlDB.SetMaxIdleConns(common.GetEnvOrDefault("SQL_MAX_IDLE_CONNS", 100))
-		sqlDB.SetMaxOpenConns(common.GetEnvOrDefault("SQL_MAX_OPEN_CONNS", 1000))
-		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
 
 		if !common.IsMasterNode {
 			return nil
@@ -227,13 +223,9 @@ func InitLogDB() (err error) {
 				panic(err)
 			}
 		}
-		sqlDB, err := LOG_DB.DB()
-		if err != nil {
+		if err := configureSQLConnectionPool(LOG_DB, "LOG_"); err != nil {
 			return err
 		}
-		sqlDB.SetMaxIdleConns(common.GetEnvOrDefault("SQL_MAX_IDLE_CONNS", 100))
-		sqlDB.SetMaxOpenConns(common.GetEnvOrDefault("SQL_MAX_OPEN_CONNS", 1000))
-		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
 
 		if !common.IsMasterNode {
 			return nil
@@ -245,6 +237,25 @@ func InitLogDB() (err error) {
 		common.FatalLog(err)
 	}
 	return err
+}
+
+func configureSQLConnectionPool(db *gorm.DB, envPrefix string) error {
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+	sqlDB.SetMaxIdleConns(getSQLPoolEnv(envPrefix, "SQL_MAX_IDLE_CONNS", 100))
+	sqlDB.SetMaxOpenConns(getSQLPoolEnv(envPrefix, "SQL_MAX_OPEN_CONNS", 1000))
+	sqlDB.SetConnMaxLifetime(time.Second * time.Duration(getSQLPoolEnv(envPrefix, "SQL_MAX_LIFETIME", 60)))
+	return nil
+}
+
+func getSQLPoolEnv(envPrefix string, name string, defaultValue int) int {
+	fallback := common.GetEnvOrDefault(name, defaultValue)
+	if envPrefix == "" {
+		return fallback
+	}
+	return common.GetEnvOrDefault(envPrefix+name, fallback)
 }
 
 func migrateDB() error {
@@ -369,10 +380,13 @@ func migrateDBFast() error {
 
 func migrateLOGDB() error {
 	var err error
-	if err = LOG_DB.AutoMigrate(&Log{}, &LogExportJob{}); err != nil {
-		return err
+	if common.LogSqlType == common.DatabaseTypePostgreSQL {
+		if err = ensurePostgresPartitionedLogDB(LOG_DB); err != nil {
+			return err
+		}
+		return LOG_DB.AutoMigrate(&LogExportJob{})
 	}
-	return nil
+	return LOG_DB.AutoMigrate(&Log{}, &LogExportJob{})
 }
 
 type sqliteColumnDef struct {
