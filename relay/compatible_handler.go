@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -174,6 +175,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		}
 
 		logger.LogDebug(c, "text request body: %s", jsonData)
+		contentAuditWrite(c, info, "request", 0, jsonData)
 
 		body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
 		if err != nil {
@@ -196,6 +198,16 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	if resp != nil {
 		httpResp = resp.(*http.Response)
 		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
+		if contentAuditEnabled(info) && !info.IsStream && httpResp.Body != nil {
+			respBody, readErr := io.ReadAll(httpResp.Body)
+			if closeErr := httpResp.Body.Close(); closeErr != nil && readErr == nil {
+				readErr = closeErr
+			}
+			if readErr == nil {
+				contentAuditWrite(c, info, "response", httpResp.StatusCode, respBody)
+				httpResp.Body = io.NopCloser(bytes.NewReader(respBody))
+			}
+		}
 		if httpResp.StatusCode != http.StatusOK {
 			newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
 			// reset status code 重置状态码
