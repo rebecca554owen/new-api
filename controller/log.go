@@ -409,7 +409,19 @@ func DeleteHistoryLogs(c *gin.Context) {
 		})
 		return
 	}
-	count, err := model.DeleteOldLog(c.Request.Context(), targetTimestamp, 100)
+	logType := model.LogTypeConsume
+	if c.Query("type") != "" {
+		parsedLogType, err := strconv.Atoi(c.Query("type"))
+		if err != nil || parsedLogType < model.LogTypeTopup || parsedLogType > model.LogTypeRefund {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "invalid log type",
+			})
+			return
+		}
+		logType = parsedLogType
+	}
+	count, err := model.DeleteOldLog(c.Request.Context(), targetTimestamp, 100, logType)
 	if err != nil {
 		common.ApiError(c, err)
 		return

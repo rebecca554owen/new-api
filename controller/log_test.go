@@ -87,6 +87,16 @@ func performDownloadTokenLogExportJob(t *testing.T, jobId string, downloadToken 
 	return w
 }
 
+func performDeleteHistoryLogs(t *testing.T, target string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodDelete, target, nil)
+	DeleteHistoryLogs(c)
+	return w
+}
+
 func waitForLogExportJobStatus(t *testing.T, jobId string, status string) *model.LogExportJob {
 	t.Helper()
 
@@ -312,5 +322,68 @@ func TestTokenLogExportJobStatusAndDownloadAreTokenScoped(t *testing.T) {
 	wrongDownloadTokenResp := performDownloadTokenLogExportJob(t, job.Id, "wrong-token")
 	if !strings.Contains(wrongDownloadTokenResp.Body.String(), "导出任务不存在") {
 		t.Fatalf("expected download token denial, got %s", wrongDownloadTokenResp.Body.String())
+	}
+}
+
+func TestDeleteHistoryLogsDefaultsToConsumeOnly(t *testing.T) {
+	setupTokenControllerTestDB(t)
+
+	logs := []model.Log{
+		{UserId: 1, CreatedAt: 10, Type: model.LogTypeConsume, Content: "old consume"},
+		{UserId: 1, CreatedAt: 10, Type: model.LogTypeTopup, Content: "old topup"},
+		{UserId: 1, CreatedAt: 10, Type: model.LogTypeRefund, Content: "old refund"},
+		{UserId: 1, CreatedAt: 30, Type: model.LogTypeConsume, Content: "new consume"},
+	}
+	if err := model.LOG_DB.Create(&logs).Error; err != nil {
+		t.Fatalf("failed to seed logs: %v", err)
+	}
+
+	w := performDeleteHistoryLogs(t, "/api/log/?target_timestamp=20")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected http 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var remaining []model.Log
+	if err := model.LOG_DB.Order("id asc").Find(&remaining).Error; err != nil {
+		t.Fatalf("failed to query remaining logs: %v", err)
+	}
+	if len(remaining) != 3 {
+		t.Fatalf("expected 3 remaining logs, got %d: %+v", len(remaining), remaining)
+	}
+	for _, log := range remaining {
+		if log.Content == "old consume" {
+			t.Fatalf("default deletion should delete old consume log: %+v", remaining)
+		}
+	}
+}
+
+func TestDeleteHistoryLogsCanDeleteSpecifiedType(t *testing.T) {
+	setupTokenControllerTestDB(t)
+
+	logs := []model.Log{
+		{UserId: 1, CreatedAt: 10, Type: model.LogTypeConsume, Content: "old consume"},
+		{UserId: 1, CreatedAt: 10, Type: model.LogTypeTopup, Content: "old topup"},
+		{UserId: 1, CreatedAt: 30, Type: model.LogTypeTopup, Content: "new topup"},
+	}
+	if err := model.LOG_DB.Create(&logs).Error; err != nil {
+		t.Fatalf("failed to seed logs: %v", err)
+	}
+
+	w := performDeleteHistoryLogs(t, "/api/log/?target_timestamp=20&type=1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected http 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var remaining []model.Log
+	if err := model.LOG_DB.Order("id asc").Find(&remaining).Error; err != nil {
+		t.Fatalf("failed to query remaining logs: %v", err)
+	}
+	if len(remaining) != 2 {
+		t.Fatalf("expected 2 remaining logs, got %d: %+v", len(remaining), remaining)
+	}
+	for _, log := range remaining {
+		if log.Content == "old topup" {
+			t.Fatalf("specified topup deletion should delete old topup log: %+v", remaining)
+		}
 	}
 }

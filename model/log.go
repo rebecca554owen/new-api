@@ -629,7 +629,7 @@ func SumUsedToken(logType int, startTimestamp int64, endTimestamp int64, modelNa
 	return token
 }
 
-func DeleteOldLog(ctx context.Context, targetTimestamp int64, limit int) (int64, error) {
+func DeleteOldLog(ctx context.Context, targetTimestamp int64, limit int, logType int) (int64, error) {
 	var total int64 = 0
 
 	for {
@@ -637,7 +637,7 @@ func DeleteOldLog(ctx context.Context, targetTimestamp int64, limit int) (int64,
 			return total, ctx.Err()
 		}
 
-		result := LOG_DB.Where("created_at < ?", targetTimestamp).Limit(limit).Delete(&Log{})
+		result := LOG_DB.Where("created_at < ? AND type = ?", targetTimestamp, logType).Limit(limit).Delete(&Log{})
 		if nil != result.Error {
 			return total, result.Error
 		}
