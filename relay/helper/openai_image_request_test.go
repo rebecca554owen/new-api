@@ -17,18 +17,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestGetAndValidOpenAIImageRequestMultipartStream verifies multipart image
-// edit parsing: the stream field is parsed and validated, and the request body
-// stays replayable for the upstream request.
-func TestGetAndValidOpenAIImageRequestMultipartStream(t *testing.T) {
+func TestGetAndValidOpenAIImageRequestMultipartBodyReplayable(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	newContext := func(t *testing.T, streamValue string, withImage bool) (*gin.Context, string) {
+	newContext := func(t *testing.T, withImage bool) (*gin.Context, string) {
 		var body bytes.Buffer
 		writer := multipart.NewWriter(&body)
 		require.NoError(t, writer.WriteField("model", "gpt-image-1"))
 		require.NoError(t, writer.WriteField("prompt", "edit this image"))
-		require.NoError(t, writer.WriteField("stream", streamValue))
+		require.NoError(t, writer.WriteField("n", "2"))
 		if withImage {
 			part, err := writer.CreateFormFile("image", "input.png")
 			require.NoError(t, err)
@@ -44,14 +41,13 @@ func TestGetAndValidOpenAIImageRequestMultipartStream(t *testing.T) {
 		return c, originalBody
 	}
 
-	t.Run("valid stream value keeps body replayable", func(t *testing.T) {
-		c, originalBody := newContext(t, "true", true)
+	t.Run("valid multipart keeps body replayable", func(t *testing.T) {
+		c, originalBody := newContext(t, true)
 
 		req, err := GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesEdits)
 		require.NoError(t, err)
-		require.NotNil(t, req.Stream)
-		require.True(t, *req.Stream)
-		require.True(t, req.IsStream(c))
+		require.NotNil(t, req.N)
+		require.Equal(t, uint(2), *req.N)
 
 		bodyAfterValidation, err := io.ReadAll(c.Request.Body)
 		require.NoError(t, err)
@@ -59,16 +55,8 @@ func TestGetAndValidOpenAIImageRequestMultipartStream(t *testing.T) {
 
 		form, err := common.ParseMultipartFormReusable(c)
 		require.NoError(t, err)
-		require.Equal(t, "true", url.Values(form.Value).Get("stream"))
+		require.Equal(t, "2", url.Values(form.Value).Get("n"))
 		require.Len(t, form.File["image"], 1)
-	})
-
-	t.Run("invalid stream value is rejected", func(t *testing.T) {
-		c, _ := newContext(t, "notabool", false)
-
-		_, err := GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesEdits)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "invalid stream value")
 	})
 }
 
