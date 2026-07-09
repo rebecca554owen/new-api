@@ -29,6 +29,7 @@ import {
 } from '../constants';
 import { visit } from 'unist-util-visit';
 import * as LobeIcons from '@lobehub/icons';
+import { Layers } from 'lucide-react';
 import {
   OpenAI,
   Claude,
