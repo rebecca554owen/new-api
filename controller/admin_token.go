@@ -5,9 +5,18 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 )
+
+func requireRootTokenKeyAccess(c *gin.Context) bool {
+	if c.GetInt("role") < common.RoleRootUser {
+		common.ApiErrorI18n(c, i18n.MsgAuthInsufficientPrivilege)
+		return false
+	}
+	return true
+}
 
 func AdminGetAllTokens(c *gin.Context) {
 	adminSearchTokens(c)
@@ -64,6 +73,10 @@ func AdminGetToken(c *gin.Context) {
 }
 
 func AdminGetTokenKey(c *gin.Context) {
+	if !requireRootTokenKeyAccess(c) {
+		return
+	}
+
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
 		common.ApiError(c, err)
@@ -82,6 +95,10 @@ func AdminGetTokenKey(c *gin.Context) {
 }
 
 func AdminGetTokenKeysBatch(c *gin.Context) {
+	if !requireRootTokenKeyAccess(c) {
+		return
+	}
+
 	tokenBatch := TokenBatch{}
 	if err := c.ShouldBindJSON(&tokenBatch); err != nil || len(tokenBatch.Ids) == 0 {
 		common.ApiErrorMsg(c, "invalid request body")

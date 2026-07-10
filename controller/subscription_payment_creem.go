@@ -1,9 +1,7 @@
 package controller
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 
@@ -23,14 +21,16 @@ type SubscriptionCreemPayRequest struct {
 func SubscriptionRequestCreemPay(c *gin.Context) {
 	var req SubscriptionCreemPayRequest
 
-	// Keep body for debugging consistency (like RequestCreemPay)
-	bodyBytes, err := io.ReadAll(c.Request.Body)
+	err := readCreemPayRequestBody(c, maxSubscriptionCreemPayRequestBodyBytes)
 	if err != nil {
+		if common.IsRequestBodyTooLargeError(err) {
+			c.AbortWithStatus(http.StatusRequestEntityTooLarge)
+			return
+		}
 		logger.LogError(c.Request.Context(), fmt.Sprintf("Creem 订阅支付请求读取失败 error=%q", err.Error()))
 		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "read query error"})
 		return
 	}
-	c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
 	if err := c.ShouldBindJSON(&req); err != nil || req.PlanId <= 0 {
 		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "参数错误"})

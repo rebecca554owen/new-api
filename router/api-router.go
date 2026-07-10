@@ -256,10 +256,10 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			tokenAdminRoute.GET("/", controller.AdminGetAllTokens)
 			tokenAdminRoute.GET("/search", controller.AdminSearchTokens)
-			tokenAdminRoute.POST("/batch/keys", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.AdminGetTokenKeysBatch)
+			tokenAdminRoute.POST("/batch/keys", middleware.RootAuth(), middleware.CriticalRateLimit(), middleware.DisableCache(), controller.AdminGetTokenKeysBatch)
 			tokenAdminRoute.POST("/batch", middleware.RootAuth(), controller.AdminDeleteTokenBatch)
 			tokenAdminRoute.GET("/:id", controller.AdminGetToken)
-			tokenAdminRoute.POST("/:id/key", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.AdminGetTokenKey)
+			tokenAdminRoute.POST("/:id/key", middleware.RootAuth(), middleware.CriticalRateLimit(), middleware.DisableCache(), controller.AdminGetTokenKey)
 			tokenAdminRoute.PUT("/", middleware.RootAuth(), controller.AdminUpdateToken)
 			tokenAdminRoute.DELETE("/:id", middleware.RootAuth(), controller.AdminDeleteToken)
 			tokenAdminRoute.POST("/grant-quota", controller.AdminGrantTokenQuota)

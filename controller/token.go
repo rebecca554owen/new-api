@@ -66,12 +66,17 @@ func resolveTokenOwnerUserID(c *gin.Context, requestedUserID int) (int, error) {
 		return currentUserID, nil
 	}
 
-	if c.GetInt("role") < common.RoleAdminUser {
+	callerRole := c.GetInt("role")
+	if callerRole < common.RoleAdminUser {
 		return 0, fmt.Errorf("无权为其他用户创建令牌")
 	}
 
-	if _, err := model.GetUserById(requestedUserID, false); err != nil {
+	targetUser, err := model.GetUserById(requestedUserID, false)
+	if err != nil {
 		return 0, err
+	}
+	if targetUser.Role >= callerRole {
+		return 0, fmt.Errorf("无权为其他用户创建令牌")
 	}
 
 	return requestedUserID, nil

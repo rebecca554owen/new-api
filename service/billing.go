@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -19,6 +20,30 @@ const (
 func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
 	session, apiErr := NewBillingSession(c, relayInfo, preConsumedQuota)
 	if apiErr != nil {
+		return apiErr
+	}
+	relayInfo.Billing = session
+	return nil
+}
+
+// PreConsumeWalletBilling preserves legacy wallet-only billing while using the
+// same atomic BillingSession lifecycle as the unified relay path.
+func PreConsumeWalletBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
+	if relayInfo == nil {
+		return types.NewError(fmt.Errorf("relayInfo is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
+	userQuota, err := model.GetUserQuota(relayInfo.UserId, false)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
+	}
+	relayInfo.UserQuota = userQuota
+	relayInfo.ForcePreConsume = true
+
+	session := &BillingSession{
+		relayInfo: relayInfo,
+		funding:   &WalletFunding{userId: relayInfo.UserId},
+	}
+	if apiErr := session.preConsume(c, preConsumedQuota); apiErr != nil {
 		return apiErr
 	}
 	relayInfo.Billing = session

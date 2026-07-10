@@ -1065,6 +1065,42 @@ func increaseUserQuota(id int, quota int) (err error) {
 	return err
 }
 
+// ErrInsufficientUserQuota is returned when an authoritative wallet
+// reservation cannot be covered by the user's current database balance.
+var ErrInsufficientUserQuota = errors.New("user quota is insufficient")
+
+// ReserveUserQuota atomically verifies and reserves wallet quota.
+//
+// Unlike DecreaseUserQuota, reservations must never be deferred to the batch
+// updater: provider work may begin only after the authoritative database row
+// has both proved sufficient funds and recorded the debit.
+func ReserveUserQuota(id int, quota int) error {
+	if quota < 0 {
+		return errors.New("quota 不能为负数！")
+	}
+	if quota == 0 {
+		return nil
+	}
+
+	result := DB.Model(&User{}).
+		Where("id = ? AND quota >= ?", id, quota).
+		UpdateColumn("quota", gorm.Expr("quota - ?", quota))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrInsufficientUserQuota
+	}
+
+	// Redis is derived state. Invalidate it only after the durable reservation
+	// succeeds so a stale cached balance can never authorize provider work.
+	// Cache failure must not turn a committed debit into a retryable error.
+	if err := invalidateUserCache(id); err != nil {
+		common.SysLog("failed to invalidate user cache after reserving quota: " + err.Error())
+	}
+	return nil
+}
+
 func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")

@@ -144,18 +144,18 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 func RequestCreemPay(c *gin.Context) {
 	var req CreemPayRequest
 
-	// 读取body内容用于打印，同时保留原始数据供后续使用
-	bodyBytes, err := io.ReadAll(c.Request.Body)
+	err := readCreemPayRequestBody(c, maxWalletCreemPayRequestBodyBytes)
 	if err != nil {
+		if common.IsRequestBodyTooLargeError(err) {
+			c.AbortWithStatus(http.StatusRequestEntityTooLarge)
+			return
+		}
 		logger.LogError(c.Request.Context(), fmt.Sprintf("Creem 支付请求读取失败 error=%q", err.Error()))
 		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "read query error"})
 		return
 	}
 
-	logger.LogInfo(c.Request.Context(), fmt.Sprintf("Creem 支付请求已收到 user_id=%d body=%q", c.GetInt("id"), string(bodyBytes)))
-
-	// 重新设置body供后续的ShouldBindJSON使用
-	c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	logger.LogInfo(c.Request.Context(), fmt.Sprintf("Creem 支付请求已收到 user_id=%d", c.GetInt("id")))
 
 	err = c.ShouldBindJSON(&req)
 	if err != nil {

@@ -19,6 +19,9 @@ type BillingSettler interface {
 	// GetPreConsumedQuota 返回实际预扣的额度值（信任用户可能为 0）。
 	GetPreConsumedQuota() int
 
+	// GetInitialPreConsumedQuota 返回会话创建时的预扣额度，不随后续 Reserve 增长。
+	GetInitialPreConsumedQuota() int
+
 	// Reserve 将预扣额度补到目标值；若目标值不高于当前预扣额度则不做任何事。
 	Reserve(targetQuota int) error
 }

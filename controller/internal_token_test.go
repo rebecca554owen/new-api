@@ -86,7 +86,8 @@ func newAdminTokenSearchRouter() *gin.Engine {
 	tokenAdminRoute.Use(middleware.AdminAuth())
 	tokenAdminRoute.GET("/", AdminGetAllTokens)
 	tokenAdminRoute.GET("/search", AdminSearchTokens)
-	tokenAdminRoute.POST("/:id/key", AdminGetTokenKey)
+	tokenAdminRoute.POST("/batch/keys", middleware.RootAuth(), AdminGetTokenKeysBatch)
+	tokenAdminRoute.POST("/:id/key", middleware.RootAuth(), AdminGetTokenKey)
 	tokenAdminRoute.PUT("/", middleware.RootAuth(), AdminUpdateToken)
 	tokenAdminRoute.DELETE("/:id", middleware.RootAuth(), AdminDeleteToken)
 
@@ -230,7 +231,7 @@ func TestAdminSearchTokensSupportsFuzzyTokenKey(t *testing.T) {
 	}
 }
 
-func TestAdminGetTokenKeyRouteAcceptsAdmin(t *testing.T) {
+func TestAdminGetTokenKeyRouteRejectsAdmin(t *testing.T) {
 	db := setupInternalTokenControllerTestDB(t)
 	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
 	token := seedInternalLookupToken(t, db, 4, "route-token", "route-real-key-123", "default", false)
@@ -244,17 +245,11 @@ func TestAdminGetTokenKeyRouteAcceptsAdmin(t *testing.T) {
 	router.ServeHTTP(recorder, request)
 
 	response := decodeAPIResponse(t, recorder)
-	if !response.Success {
-		t.Fatalf("expected success response, got %+v", response)
+	if response.Success {
+		t.Fatalf("expected role-10 administrator key reveal to fail")
 	}
-	var payload struct {
-		Key string `json:"key"`
-	}
-	if err := common.Unmarshal(response.Data, &payload); err != nil {
-		t.Fatalf("failed to decode admin token key response: %v", err)
-	}
-	if payload.Key != token.Key {
-		t.Fatalf("expected full key %q, got %q", token.Key, payload.Key)
+	if strings.Contains(recorder.Body.String(), token.Key) {
+		t.Fatalf("role-10 administrator response leaked raw token key: %s", recorder.Body.String())
 	}
 }
 
@@ -382,15 +377,15 @@ func TestAdminTokenSearchRouteRejectsNonAdminAccessToken(t *testing.T) {
 		t.Fatalf("expected permission denied message, got %q", response.Message)
 	}
 }
-func TestAdminGetTokenKeyRouteReturnsFullKey(t *testing.T) {
+func TestAdminGetTokenKeyRouteReturnsFullKeyForRoot(t *testing.T) {
 	db := setupInternalTokenControllerTestDB(t)
-	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
+	seedInternalUser(t, db, 2, common.RoleRootUser, "default", "root-access-token")
 	token := seedInternalLookupToken(t, db, 4, "route-token", "route-key-secret", "default", false)
 
 	router := newAdminTokenSearchRouter()
 	request := httptest.NewRequest(http.MethodPost, "/api/token/admin/"+strconv.Itoa(token.Id)+"/key", nil)
-	request.Header.Set("Authorization", "Bearer admin-access-token")
-	request.Header.Set("New-Api-User", "1")
+	request.Header.Set("Authorization", "Bearer root-access-token")
+	request.Header.Set("New-Api-User", "2")
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)

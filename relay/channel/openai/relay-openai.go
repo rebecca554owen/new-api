@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -361,9 +362,25 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	usage := &dto.RealtimeUsage{}
 	localUsage := &dto.RealtimeUsage{}
 	sumUsage := &dto.RealtimeUsage{}
+	var usageMu sync.Mutex
+	var readerWG sync.WaitGroup
+	readerWG.Add(2)
 
 	gopool.Go(func() {
+		defer readerWG.Done()
+		usageLocked := false
+		lockUsage := func() {
+			usageMu.Lock()
+			usageLocked = true
+		}
+		unlockUsage := func() {
+			usageLocked = false
+			usageMu.Unlock()
+		}
 		defer func() {
+			if usageLocked {
+				usageMu.Unlock()
+			}
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("panic in client reader: %v", r)
 			}
@@ -389,6 +406,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					return
 				}
 
+				lockUsage()
 				if realtimeEvent.Type == dto.RealtimeEventTypeSessionUpdate {
 					if realtimeEvent.Session != nil {
 						if realtimeEvent.Session.Tools != nil {
@@ -399,6 +417,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 
 				textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
 				if err != nil {
+					unlockUsage()
 					errChan <- fmt.Errorf("error counting text token: %v", err)
 					return
 				}
@@ -407,6 +426,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				localUsage.InputTokens += textToken + audioToken
 				localUsage.InputTokenDetails.TextTokens += textToken
 				localUsage.InputTokenDetails.AudioTokens += audioToken
+				unlockUsage()
 
 				err = helper.WssString(c, targetConn, string(message))
 				if err != nil {
@@ -423,7 +443,20 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	})
 
 	gopool.Go(func() {
+		defer readerWG.Done()
+		usageLocked := false
+		lockUsage := func() {
+			usageMu.Lock()
+			usageLocked = true
+		}
+		unlockUsage := func() {
+			usageLocked = false
+			usageMu.Unlock()
+		}
 		defer func() {
+			if usageLocked {
+				usageMu.Unlock()
+			}
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("panic in target reader: %v", r)
 			}
@@ -450,6 +483,12 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				}
 
 				if realtimeEvent.Type == dto.RealtimeEventTypeResponseDone {
+					lockUsage()
+					if realtimeEvent.Response == nil {
+						unlockUsage()
+						errChan <- fmt.Errorf("response.done event is missing response")
+						return
+					}
 					realtimeUsage := realtimeEvent.Response.Usage
 					if realtimeUsage != nil {
 						usage.TotalTokens += realtimeUsage.TotalTokens
@@ -461,17 +500,21 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						usage.OutputTokenDetails.AudioTokens += realtimeUsage.OutputTokenDetails.AudioTokens
 						usage.OutputTokenDetails.TextTokens += realtimeUsage.OutputTokenDetails.TextTokens
 						err := preConsumeUsage(c, info, usage, sumUsage)
+						// Official usage supersedes the local estimate for this
+						// response, whether reserving the next headroom succeeds or
+						// not. Clear both to prevent tail cleanup from counting the
+						// same delivered response twice.
+						usage = &dto.RealtimeUsage{}
+						localUsage = &dto.RealtimeUsage{}
 						if err != nil {
+							unlockUsage()
 							errChan <- fmt.Errorf("error consume usage: %v", err)
 							return
 						}
-						// 本次计费完成，清除
-						usage = &dto.RealtimeUsage{}
-
-						localUsage = &dto.RealtimeUsage{}
 					} else {
 						textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
 						if err != nil {
+							unlockUsage()
 							errChan <- fmt.Errorf("error counting text token: %v", err)
 							return
 						}
@@ -482,28 +525,31 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						localUsage.InputTokenDetails.TextTokens += textToken
 						localUsage.InputTokenDetails.AudioTokens += audioToken
 						err = preConsumeUsage(c, info, localUsage, sumUsage)
+						localUsage = &dto.RealtimeUsage{}
 						if err != nil {
+							unlockUsage()
 							errChan <- fmt.Errorf("error consume usage: %v", err)
 							return
 						}
-						// 本次计费完成，清除
-						localUsage = &dto.RealtimeUsage{}
-						// print now usage
 					}
 					logger.LogInfo(c, fmt.Sprintf("realtime streaming sumUsage: %v", sumUsage))
 					logger.LogInfo(c, fmt.Sprintf("realtime streaming localUsage: %v", localUsage))
-					logger.LogInfo(c, fmt.Sprintf("realtime streaming localUsage: %v", localUsage))
+					unlockUsage()
 
 				} else if realtimeEvent.Type == dto.RealtimeEventTypeSessionUpdated || realtimeEvent.Type == dto.RealtimeEventTypeSessionCreated {
+					lockUsage()
 					realtimeSession := realtimeEvent.Session
 					if realtimeSession != nil {
 						// update audio format
 						info.InputAudioFormat = common.GetStringIfEmpty(realtimeSession.InputAudioFormat, info.InputAudioFormat)
 						info.OutputAudioFormat = common.GetStringIfEmpty(realtimeSession.OutputAudioFormat, info.OutputAudioFormat)
 					}
+					unlockUsage()
 				} else {
+					lockUsage()
 					textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
 					if err != nil {
+						unlockUsage()
 						errChan <- fmt.Errorf("error counting text token: %v", err)
 						return
 					}
@@ -512,6 +558,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					localUsage.OutputTokens += textToken + audioToken
 					localUsage.OutputTokenDetails.TextTokens += textToken
 					localUsage.OutputTokenDetails.AudioTokens += audioToken
+					unlockUsage()
 				}
 
 				err = helper.WssString(c, clientConn, string(message))
@@ -537,6 +584,14 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	case <-c.Done():
 	}
 
+	// Stop both readers and wait for them before taking the final billing
+	// snapshot. Without this join, a client disconnect can race the upstream
+	// reader and lose or duplicate local usage increments.
+	_ = clientConn.Close()
+	_ = targetConn.Close()
+	readerWG.Wait()
+
+	usageMu.Lock()
 	if usage.TotalTokens != 0 {
 		_ = preConsumeUsage(c, info, usage, sumUsage)
 	}
@@ -544,6 +599,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	if localUsage.TotalTokens != 0 {
 		_ = preConsumeUsage(c, info, localUsage, sumUsage)
 	}
+	usageMu.Unlock()
 
 	// check usage total tokens, if 0, use local usage
 
@@ -555,16 +611,22 @@ func preConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.R
 		return fmt.Errorf("invalid usage pointer")
 	}
 
-	totalUsage.TotalTokens += usage.TotalTokens
-	totalUsage.InputTokens += usage.InputTokens
-	totalUsage.OutputTokens += usage.OutputTokens
-	totalUsage.InputTokenDetails.CachedTokens += usage.InputTokenDetails.CachedTokens
-	totalUsage.InputTokenDetails.TextTokens += usage.InputTokenDetails.TextTokens
-	totalUsage.InputTokenDetails.AudioTokens += usage.InputTokenDetails.AudioTokens
-	totalUsage.OutputTokenDetails.TextTokens += usage.OutputTokenDetails.TextTokens
-	totalUsage.OutputTokenDetails.AudioTokens += usage.OutputTokenDetails.AudioTokens
-	// clear usage
-	err := service.PreWssConsumeQuota(ctx, info, usage)
+	candidate := *totalUsage
+	candidate.TotalTokens += usage.TotalTokens
+	candidate.InputTokens += usage.InputTokens
+	candidate.OutputTokens += usage.OutputTokens
+	candidate.InputTokenDetails.CachedTokens += usage.InputTokenDetails.CachedTokens
+	candidate.InputTokenDetails.TextTokens += usage.InputTokenDetails.TextTokens
+	candidate.InputTokenDetails.AudioTokens += usage.InputTokenDetails.AudioTokens
+	candidate.OutputTokenDetails.TextTokens += usage.OutputTokenDetails.TextTokens
+	candidate.OutputTokenDetails.AudioTokens += usage.OutputTokenDetails.AudioTokens
+
+	err := service.PreWssConsumeQuota(ctx, info, &candidate)
+	// The provider output represented by candidate has already been delivered
+	// before response.done arrives. Keep it in the final settlement even when
+	// reserving the next-round headroom fails; otherwise the initial pre-consume
+	// could be refunded and turn delivered work into free usage.
+	*totalUsage = candidate
 	return err
 }
 

@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -21,9 +22,17 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 )
+
+func midjourneyBillingError(err *types.NewAPIError) *dto.MidjourneyResponse {
+	if errors.Is(err, model.ErrInsufficientUserQuota) || err.GetErrorCode() == types.ErrorCodePreConsumeTokenQuotaFailed {
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, "quota_not_enough")
+	}
+	return service.MidjourneyErrorWrapper(constant.MjRequestError, err.Error())
+}
 
 func RelayMidjourneyImage(c *gin.Context) {
 	taskId := c.Param("id")
@@ -209,20 +218,19 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 			Description: err.Error(),
 		}
 	}
+	info.PriceData = priceData
 
-	userQuota, err := model.GetUserQuota(info.UserId, false)
-	if err != nil {
-		return &dto.MidjourneyResponse{
-			Code:        4,
-			Description: err.Error(),
+	billingPending := false
+	if priceData.Quota > 0 {
+		if apiErr := service.PreConsumeWalletBilling(c, priceData.Quota, info); apiErr != nil {
+			return midjourneyBillingError(apiErr)
 		}
-	}
-
-	if userQuota-priceData.Quota < 0 {
-		return &dto.MidjourneyResponse{
-			Code:        4,
-			Description: "quota_not_enough",
-		}
+		billingPending = true
+		defer func() {
+			if billingPending && info.Billing != nil {
+				info.Billing.Refund(c)
+			}
+		}()
 	}
 	requestURL := getMjRequestPath(c.Request.URL.String())
 	baseURL := c.GetString("base_url")
@@ -231,12 +239,14 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 	if err != nil {
 		return &mjResp.Response
 	}
+	accepted := mjResp.StatusCode == http.StatusOK && mjResp.Response.Code == 1
 	defer func() {
-		if mjResp.StatusCode == 200 && mjResp.Response.Code == 1 {
-			err := service.PostConsumeQuota(info, priceData.Quota, 0, true)
-			if err != nil {
-				common.SysLog("error consuming token remain quota: " + err.Error())
+		if accepted {
+			if settleErr := service.SettleBilling(c, info, priceData.Quota); settleErr != nil {
+				common.SysLog("error settling midjourney billing: " + settleErr.Error())
+				return
 			}
+			billingPending = false
 
 			tokenName := c.GetString("token_name")
 			logContent := fmt.Sprintf("模型固定价格 %.2f，分组倍率 %.2f，操作 %s", priceData.ModelPrice, priceData.GroupRatioInfo.GroupRatio, constant.MjActionSwapFace)
@@ -273,7 +283,10 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 		Progress:    "0%",
 		FailReason:  "",
 		ChannelId:   c.GetInt("channel_id"),
-		Quota:       priceData.Quota,
+		Quota:       0,
+	}
+	if accepted {
+		midjourneyTask.Quota = priceData.Quota
 	}
 	err = midjourneyTask.Insert()
 	if err != nil {
@@ -516,20 +529,19 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 			Description: err.Error(),
 		}
 	}
+	relayInfo.PriceData = priceData
 
-	userQuota, err := model.GetUserQuota(relayInfo.UserId, false)
-	if err != nil {
-		return &dto.MidjourneyResponse{
-			Code:        4,
-			Description: err.Error(),
+	billingPending := false
+	if consumeQuota && priceData.Quota > 0 {
+		if apiErr := service.PreConsumeWalletBilling(c, priceData.Quota, relayInfo); apiErr != nil {
+			return midjourneyBillingError(apiErr)
 		}
-	}
-
-	if consumeQuota && userQuota-priceData.Quota < 0 {
-		return &dto.MidjourneyResponse{
-			Code:        4,
-			Description: "quota_not_enough",
-		}
+		billingPending = true
+		defer func() {
+			if billingPending && relayInfo.Billing != nil {
+				relayInfo.Billing.Refund(c)
+			}
+		}()
 	}
 
 	midjResponseWithStatus, responseBody, err := service.DoMidjourneyHttpRequest(c, time.Second*60, fullRequestURL)
@@ -540,10 +552,11 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 
 	defer func() {
 		if consumeQuota && midjResponseWithStatus.StatusCode == 200 {
-			err := service.PostConsumeQuota(relayInfo, priceData.Quota, 0, true)
-			if err != nil {
-				common.SysLog("error consuming token remain quota: " + err.Error())
+			if settleErr := service.SettleBilling(c, relayInfo, priceData.Quota); settleErr != nil {
+				common.SysLog("error settling midjourney billing: " + settleErr.Error())
+				return
 			}
+			billingPending = false
 			tokenName := c.GetString("token_name")
 			logContent := fmt.Sprintf("模型固定价格 %.2f，分组倍率 %.2f，操作 %s，ID %s", priceData.ModelPrice, priceData.GroupRatioInfo.GroupRatio, midjRequest.Action, midjResponse.Result)
 			other := service.GenerateMjOtherInfo(relayInfo, priceData)
@@ -586,7 +599,7 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 		Progress:    "0%",
 		FailReason:  "",
 		ChannelId:   c.GetInt("channel_id"),
-		Quota:       priceData.Quota,
+		Quota:       0,
 	}
 	if midjResponse.Code == 3 {
 		//无实例账号自动禁用渠道（No available account instance）
@@ -602,6 +615,9 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 		//非1-提交成功,21-任务已存在和22-排队中，则记录错误原因
 		midjourneyTask.FailReason = midjResponse.Description
 		consumeQuota = false
+	}
+	if consumeQuota && midjResponseWithStatus.StatusCode == http.StatusOK {
+		midjourneyTask.Quota = priceData.Quota
 	}
 
 	if midjResponse.Code == 21 { //21-任务已存在（处理中或者有结果了）

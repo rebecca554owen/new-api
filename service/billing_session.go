@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -23,16 +24,17 @@ import (
 // BillingSession 封装单次请求的预扣费/结算/退款生命周期。
 // 实现 relaycommon.BillingSettler 接口。
 type BillingSession struct {
-	relayInfo        *relaycommon.RelayInfo
-	funding          FundingSource
-	preConsumedQuota int  // 实际预扣额度（信任用户可能为 0）
-	tokenConsumed    int  // 令牌额度实际扣减量
-	extraReserved    int  // 发送前补充预扣的额度（订阅退款时需要单独回滚）
-	trusted          bool // 是否命中信任额度旁路
-	fundingSettled   bool // funding.Settle 已成功，资金来源已提交
-	settled          bool // Settle 全部完成（资金 + 令牌）
-	refunded         bool // Refund 已调用
-	mu               sync.Mutex
+	relayInfo               *relaycommon.RelayInfo
+	funding                 FundingSource
+	preConsumedQuota        int  // 实际预扣额度（信任用户可能为 0）
+	initialPreConsumedQuota int  // 会话创建时的预扣额度，用作流式请求下一轮 headroom
+	tokenConsumed           int  // 令牌额度实际扣减量
+	extraReserved           int  // 发送前补充预扣的额度（订阅退款时需要单独回滚）
+	trusted                 bool // 是否命中信任额度旁路
+	fundingSettled          bool // funding.Settle 已成功，资金来源已提交
+	settled                 bool // Settle 全部完成（资金 + 令牌）
+	refunded                bool // Refund 已调用
+	mu                      sync.Mutex
 }
 
 // Settle 根据实际消耗额度进行结算。
@@ -149,6 +151,11 @@ func (s *BillingSession) GetPreConsumedQuota() int {
 	return s.preConsumedQuota
 }
 
+// GetInitialPreConsumedQuota 返回会话创建时的预扣额度，不随 Reserve 增长。
+func (s *BillingSession) GetInitialPreConsumedQuota() int {
+	return s.initialPreConsumedQuota
+}
+
 func (s *BillingSession) Reserve(targetQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -213,6 +220,15 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 			}
 			s.tokenConsumed = 0
 		}
+		if errors.Is(err, model.ErrInsufficientUserQuota) {
+			return types.NewErrorWithStatusCode(
+				fmt.Errorf("预扣费额度失败: %w", err),
+				types.ErrorCodeInsufficientUserQuota,
+				http.StatusForbidden,
+				types.ErrOptionWithSkipRetry(),
+				types.ErrOptionWithNoRecordErrorLog(),
+			)
+		}
 		// TODO: model 层应定义哨兵错误（如 ErrNoActiveSubscription），用 errors.Is 替代字符串匹配
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "no active subscription") || strings.Contains(errMsg, "subscription quota insufficient") {
@@ -222,6 +238,7 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	}
 
 	s.preConsumedQuota = effectiveQuota
+	s.initialPreConsumedQuota = effectiveQuota
 
 	// ---- 同步 RelayInfo 兼容字段 ----
 	s.syncRelayInfo()
@@ -232,7 +249,16 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 func (s *BillingSession) reserveFunding(delta int) error {
 	switch funding := s.funding.(type) {
 	case *WalletFunding:
-		if err := model.DecreaseUserQuota(funding.userId, delta, false); err != nil {
+		if err := model.ReserveUserQuota(funding.userId, delta); err != nil {
+			if errors.Is(err, model.ErrInsufficientUserQuota) {
+				return types.NewErrorWithStatusCode(
+					fmt.Errorf("预扣费额度失败: %w", err),
+					types.ErrorCodeInsufficientUserQuota,
+					http.StatusForbidden,
+					types.ErrOptionWithSkipRetry(),
+					types.ErrOptionWithNoRecordErrorLog(),
+				)
+			}
 			return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 		}
 		funding.consumed += delta
@@ -302,7 +328,9 @@ func (s *BillingSession) shouldTrust(c *gin.Context) bool {
 
 	switch s.funding.Source() {
 	case BillingSourceWallet:
-		return s.relayInfo.UserQuota > trustQuota
+		// Wallet requests must reserve quota in the authoritative database before
+		// provider dispatch. A high cached balance is not a concurrency control.
+		return false
 	case BillingSourceSubscription:
 		// 订阅不能启用信任旁路。原因：
 		// 1. PreConsumeUserSubscription 要求 amount>0 来创建预扣记录并锁定订阅
