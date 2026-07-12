@@ -42,7 +42,7 @@ const buildCodexPassHeadersTemplate = () => ({
 // https://github.com/openai/codex/commit/14df0e8833aad0d6d78287954b61ffac67af936c
 // https://github.com/openai/codex/commit/ebdd8795e924a8149b616e46ca2ed7848c207a4b
 export const CODEX_CLI_HEADER_PASSTHROUGH_HEADERS = [
-	'X-Session-ID',
+  'X-Session-ID',
   'Originator',
   'Session_id',
   'Thread_id',
