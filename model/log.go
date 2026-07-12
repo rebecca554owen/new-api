@@ -214,15 +214,23 @@ func GetLogByTokenIdCursor(ctx context.Context, tokenId int, startTimestamp int6
 	if endTimestamp != 0 {
 		tx = tx.Where("created_at <= ?", endTimestamp)
 	}
-	if beforeId > 0 {
+	usingClickHouse := common.UsingLogDatabase(common.DatabaseTypeClickHouse)
+	if beforeId > 0 && !usingClickHouse {
 		tx = tx.Where("id < ?", beforeId)
 	}
 
-	err = tx.Order("id desc").Limit(num).Find(&logs).Error
+	order := "id desc"
+	if usingClickHouse {
+		order = clickHouseLogOrder("")
+		tx = tx.Offset(startIdx)
+	}
+	err = tx.Order(order).Limit(num).Find(&logs).Error
 	if err != nil {
 		return nil, 0, err
 	}
-	if len(logs) > 0 {
+	if usingClickHouse && len(logs) == num {
+		nextBeforeId = 1
+	} else if len(logs) > 0 {
 		nextBeforeId = logs[len(logs)-1].Id
 	}
 	formatUserLogs(logs, startIdx)
