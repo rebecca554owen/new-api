@@ -90,6 +90,7 @@ func init() {
 type LogCleanupPayload struct {
 	TargetTimestamp int64 `json:"target_timestamp"`
 	BatchSize       int   `json:"batch_size"`
+	LogType         int   `json:"log_type"`
 }
 
 type LogCleanupState struct {
@@ -166,6 +167,10 @@ func StartSystemTaskRunner() {
 }
 
 func StartLogCleanupTask(targetTimestamp int64) (*model.SystemTask, error) {
+	return StartLogCleanupTaskForType(targetTimestamp, model.LogTypeConsume)
+}
+
+func StartLogCleanupTaskForType(targetTimestamp int64, logType int) (*model.SystemTask, error) {
 	if targetTimestamp <= 0 {
 		return nil, errors.New("target timestamp is required")
 	}
@@ -181,6 +186,7 @@ func StartLogCleanupTask(targetTimestamp int64) (*model.SystemTask, error) {
 	payload := LogCleanupPayload{
 		TargetTimestamp: targetTimestamp,
 		BatchSize:       logCleanupBatchSize,
+		LogType:         logType,
 	}
 	state := LogCleanupState{}
 	task, err := model.CreateSystemTask(model.SystemTaskTypeLogCleanup, payload, state)
@@ -348,6 +354,9 @@ func runLogCleanupTask(ctx context.Context, task *model.SystemTask, runnerID str
 	if payload.BatchSize <= 0 {
 		payload.BatchSize = logCleanupBatchSize
 	}
+	if payload.LogType == 0 {
+		payload.LogType = model.LogTypeConsume
+	}
 
 	state := LogCleanupState{}
 	if err := task.DecodeState(&state); err != nil {
@@ -356,7 +365,7 @@ func runLogCleanupTask(ctx context.Context, task *model.SystemTask, runnerID str
 	}
 
 	for {
-		remaining, err := model.CountOldLog(ctx, payload.TargetTimestamp)
+		remaining, err := model.CountOldLog(ctx, payload.TargetTimestamp, payload.LogType)
 		if err != nil {
 			failSystemTask(task, runnerID, err)
 			return
@@ -376,7 +385,7 @@ func runLogCleanupTask(ctx context.Context, task *model.SystemTask, runnerID str
 		// rows cannot be removed and we fail instead of busy-looping.
 		progressed := false
 		for state.Remaining > 0 {
-			rowsAffected, err := model.DeleteOldLogBatch(ctx, payload.TargetTimestamp, payload.BatchSize)
+			rowsAffected, err := model.DeleteOldLogBatch(ctx, payload.TargetTimestamp, payload.BatchSize, payload.LogType)
 			if err != nil {
 				failSystemTask(task, runnerID, err)
 				return

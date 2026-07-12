@@ -411,7 +411,11 @@ func DeleteHistoryLogs(c *gin.Context) {
 		})
 		return
 	}
-	count, err := model.DeleteOldLog(c.Request.Context(), targetTimestamp, 100)
+	logType, ok := parseLogCleanupType(c)
+	if !ok {
+		return
+	}
+	count, err := model.DeleteOldLog(c.Request.Context(), targetTimestamp, 100, logType)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -422,4 +426,20 @@ func DeleteHistoryLogs(c *gin.Context) {
 		"data":    count,
 	})
 	return
+}
+
+func parseLogCleanupType(c *gin.Context) (int, bool) {
+	logType := model.LogTypeConsume
+	if c.Query("type") == "" {
+		return logType, true
+	}
+	parsedLogType, err := strconv.Atoi(c.Query("type"))
+	if err != nil || parsedLogType < model.LogTypeTopup || parsedLogType > model.LogTypeLogin {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "invalid log type",
+		})
+		return 0, false
+	}
+	return parsedLogType, true
 }

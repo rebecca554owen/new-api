@@ -792,15 +792,15 @@ func SumUsedToken(logType int, startTimestamp int64, endTimestamp int64, modelNa
 	return token
 }
 
-func CountOldLog(ctx context.Context, targetTimestamp int64) (int64, error) {
+func CountOldLog(ctx context.Context, targetTimestamp int64, logType int) (int64, error) {
 	var total int64
-	if err := LOG_DB.WithContext(ctx).Model(&Log{}).Where("created_at < ?", targetTimestamp).Count(&total).Error; err != nil {
+	if err := LOG_DB.WithContext(ctx).Model(&Log{}).Where("created_at < ? AND type = ?", targetTimestamp, logType).Count(&total).Error; err != nil {
 		return 0, err
 	}
 	return total, nil
 }
 
-func DeleteOldLogBatch(ctx context.Context, targetTimestamp int64, limit int) (int64, error) {
+func DeleteOldLogBatch(ctx context.Context, targetTimestamp int64, limit int, logType int) (int64, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -813,7 +813,7 @@ func DeleteOldLogBatch(ctx context.Context, targetTimestamp int64, limit int) (i
 		// per-batch mutations would be pathologically slow. Remove all matching
 		// rows in a single synchronous mutation regardless of limit; the reported
 		// count lets the caller's progress loop complete in one pass.
-		total, err := CountOldLog(ctx, targetTimestamp)
+		total, err := CountOldLog(ctx, targetTimestamp, logType)
 		if err != nil {
 			return 0, err
 		}
@@ -821,22 +821,22 @@ func DeleteOldLogBatch(ctx context.Context, targetTimestamp int64, limit int) (i
 			return 0, nil
 		}
 		if err := LOG_DB.WithContext(ctx).Exec(
-			"ALTER TABLE logs DELETE WHERE created_at < ? SETTINGS mutations_sync = 1",
-			targetTimestamp,
+			"ALTER TABLE logs DELETE WHERE created_at < ? AND type = ? SETTINGS mutations_sync = 1",
+			targetTimestamp, logType,
 		).Error; err != nil {
 			return 0, err
 		}
 		return total, nil
 	}
 
-	result := LOG_DB.WithContext(ctx).Where("created_at < ?", targetTimestamp).Limit(limit).Delete(&Log{})
+	result := LOG_DB.WithContext(ctx).Where("created_at < ? AND type = ?", targetTimestamp, logType).Limit(limit).Delete(&Log{})
 	if nil != result.Error {
 		return 0, result.Error
 	}
 	return result.RowsAffected, nil
 }
 
-func DeleteOldLog(ctx context.Context, targetTimestamp int64, limit int) (int64, error) {
+func DeleteOldLog(ctx context.Context, targetTimestamp int64, limit int, logType int) (int64, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -848,7 +848,7 @@ func DeleteOldLog(ctx context.Context, targetTimestamp int64, limit int) (int64,
 			return total, ctx.Err()
 		}
 
-		rowsAffected, err := DeleteOldLogBatch(ctx, targetTimestamp, limit)
+		rowsAffected, err := DeleteOldLogBatch(ctx, targetTimestamp, limit, logType)
 		if nil != err {
 			return total, err
 		}

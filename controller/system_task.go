@@ -21,7 +21,11 @@ func CreateLogCleanupSystemTask(c *gin.Context) {
 		return
 	}
 
-	task, err := service.StartLogCleanupTask(targetTimestamp)
+	logType, ok := parseLogCleanupType(c)
+	if !ok {
+		return
+	}
+	task, err := service.StartLogCleanupTaskForType(targetTimestamp, logType)
 	if err != nil {
 		common.ApiError(c, err)
 		return
