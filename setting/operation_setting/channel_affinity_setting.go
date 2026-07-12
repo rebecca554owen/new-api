@@ -45,6 +45,7 @@ type ChannelAffinitySetting struct {
 // x-codex-turn-state response/request round trip:
 // https://github.com/openai/codex/commit/ebdd8795e924a8149b616e46ca2ed7848c207a4b
 var codexCliPassThroughHeaders = []string{
+	"X-Session-ID",
 	"Originator",
 	"Session_id",
 	"Thread_id",
@@ -121,6 +122,9 @@ var channelAffinitySetting = ChannelAffinitySetting{
 			ModelRegex: []string{"^gpt-.*$"},
 			PathRegex:  []string{"/v1/responses"},
 			KeySources: []ChannelAffinityKeySource{
+				{Type: "request_header", Key: "X-Session-ID"},
+				{Type: "request_header", Key: "Session-Id"},
+				{Type: "request_header", Key: "Session_id"},
 				{Type: "gjson", Path: "prompt_cache_key"},
 			},
 			ValueRegex:            "",

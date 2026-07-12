@@ -42,6 +42,7 @@ const buildCodexPassHeadersTemplate = () => ({
 // https://github.com/openai/codex/commit/14df0e8833aad0d6d78287954b61ffac67af936c
 // https://github.com/openai/codex/commit/ebdd8795e924a8149b616e46ca2ed7848c207a4b
 export const CODEX_CLI_HEADER_PASSTHROUGH_HEADERS = [
+	'X-Session-ID',
   'Originator',
   'Session_id',
   'Thread_id',
@@ -90,7 +91,12 @@ export const CHANNEL_AFFINITY_RULE_TEMPLATES = {
     name: 'codex cli trace',
     model_regex: ['^gpt-.*$'],
     path_regex: ['/v1/responses'],
-    key_sources: [{ type: 'gjson', path: 'prompt_cache_key' }],
+    key_sources: [
+      { type: 'request_header', key: 'X-Session-ID' },
+      { type: 'request_header', key: 'Session-Id' },
+      { type: 'request_header', key: 'Session_id' },
+      { type: 'gjson', path: 'prompt_cache_key' },
+    ],
     param_override_template: buildCodexPassHeadersTemplate(),
     value_regex: '',
     ttl_seconds: 0,
