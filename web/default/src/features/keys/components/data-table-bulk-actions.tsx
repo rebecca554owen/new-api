@@ -30,6 +30,8 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { copyToClipboard } from '@/lib/copy-to-clipboard'
+import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { type ApiKey } from '../types'
 import { ApiKeysMultiDeleteDialog } from './api-keys-multi-delete-dialog'
@@ -43,6 +45,10 @@ export function DataTableBulkActions<TData>({
   table,
 }: DataTableBulkActionsProps<TData>) {
   const { t } = useTranslation()
+  const currentRole = useAuthStore(
+    (state) => state.auth.user?.role ?? ROLE.GUEST
+  )
+  const canDelete = currentRole < ROLE.ADMIN || currentRole >= ROLE.SUPER_ADMIN
   const { resolveRealKeysBatch } = useApiKeys()
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [isCopying, setIsCopying] = useState(false)
@@ -107,25 +113,27 @@ export function DataTableBulkActions<TData>({
           </TooltipContent>
         </Tooltip>
 
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <Button
-                variant='destructive'
-                size='icon'
-                onClick={() => setShowDeleteConfirm(true)}
-                className='size-8'
-                aria-label={t('Delete selected API keys')}
-              />
-            }
-          >
-            <Trash2 />
-            <span className='sr-only'>{t('Delete selected API keys')}</span>
-          </TooltipTrigger>
-          <TooltipContent>
-            <p>{t('Delete selected API keys')}</p>
-          </TooltipContent>
-        </Tooltip>
+        {canDelete && (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant='destructive'
+                  size='icon'
+                  onClick={() => setShowDeleteConfirm(true)}
+                  className='size-8'
+                  aria-label={t('Delete selected API keys')}
+                />
+              }
+            >
+              <Trash2 />
+              <span className='sr-only'>{t('Delete selected API keys')}</span>
+            </TooltipTrigger>
+            <TooltipContent>
+              <p>{t('Delete selected API keys')}</p>
+            </TooltipContent>
+          </Tooltip>
+        )}
       </BulkActionsToolbar>
 
       <ApiKeysMultiDeleteDialog

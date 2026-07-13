@@ -30,6 +30,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { useIsAdmin } from '@/hooks/use-admin'
 import { toIntlLocale } from '@/i18n/languages'
 import { getUserGroups } from '@/lib/api'
 import dayjs from '@/lib/dayjs'
@@ -74,11 +75,12 @@ function useGroupRatios(): Record<string, number> {
 
 export function useApiKeysColumns(now: number): ColumnDef<ApiKey>[] {
   const { t, i18n } = useTranslation()
+  const isAdmin = useIsAdmin()
   const groupRatios = useGroupRatios()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const justNowLabel = t('Just now')
   const staleAccessThreshold = dayjs(now).subtract(3, 'month').valueOf()
-  return [
+  const columns: ColumnDef<ApiKey>[] = [
     {
       id: 'select',
       header: ({ table }) => (
@@ -111,6 +113,16 @@ export function useApiKeysColumns(now: number): ColumnDef<ApiKey>[] {
       size: 180,
       meta: { mobileTitle: true },
     },
+    ...(isAdmin
+      ? [
+          {
+            accessorKey: 'username',
+            header: t('User'),
+            cell: ({ row }) => row.original.username || '-',
+            size: 140,
+          } satisfies ColumnDef<ApiKey>,
+        ]
+      : []),
     {
       accessorKey: 'status',
       header: t('Status'),
@@ -333,4 +345,5 @@ export function useApiKeysColumns(now: number): ColumnDef<ApiKey>[] {
       meta: { pinned: 'right' as const },
     },
   ]
+  return columns
 }

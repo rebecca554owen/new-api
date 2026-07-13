@@ -17,6 +17,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
+import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
 
 import type {
   ApiKey,
@@ -31,12 +33,17 @@ import type {
 // API Key Management
 // ============================================================================
 
+function isAdminRequest(): boolean {
+  return (useAuthStore.getState().auth.user?.role ?? 0) >= ROLE.ADMIN
+}
+
 // Get paginated API keys list
 export async function getApiKeys(
   params: GetApiKeysParams = {}
 ): Promise<GetApiKeysResponse> {
   const { p = 1, size = 10 } = params
-  const res = await api.get(`/api/token/?p=${p}&size=${size}`)
+  const endpoint = isAdminRequest() ? '/api/token/admin' : '/api/token/'
+  const res = await api.get(`${endpoint}?p=${p}&size=${size}`)
   return res.data
 }
 
@@ -50,13 +57,19 @@ export async function searchApiKeys(
   if (token) queryParams.set('token', token)
   if (p != null) queryParams.set('p', String(p))
   if (size != null) queryParams.set('size', String(size))
-  const res = await api.get(`/api/token/search?${queryParams.toString()}`)
+  const endpoint = isAdminRequest()
+    ? '/api/token/admin/search'
+    : '/api/token/search'
+  const res = await api.get(`${endpoint}?${queryParams.toString()}`)
   return res.data
 }
 
 // Get single API key by ID
 export async function getApiKey(id: number): Promise<ApiResponse<ApiKey>> {
-  const res = await api.get(`/api/token/${id}`)
+  const endpoint = isAdminRequest()
+    ? `/api/token/admin/${id}`
+    : `/api/token/${id}`
+  const res = await api.get(endpoint)
   return res.data
 }
 
@@ -72,13 +85,17 @@ export async function createApiKey(
 export async function updateApiKey(
   data: ApiKeyFormData & { id: number }
 ): Promise<ApiResponse<ApiKey>> {
-  const res = await api.put('/api/token/', data)
+  const endpoint = isAdminRequest() ? '/api/token/admin/' : '/api/token/'
+  const res = await api.put(endpoint, data)
   return res.data
 }
 
 // Delete a single API key
 export async function deleteApiKey(id: number): Promise<ApiResponse> {
-  const res = await api.delete(`/api/token/${id}/`)
+  const endpoint = isAdminRequest()
+    ? `/api/token/admin/${id}`
+    : `/api/token/${id}/`
+  const res = await api.delete(endpoint)
   return res.data
 }
 
@@ -86,7 +103,10 @@ export async function deleteApiKey(id: number): Promise<ApiResponse> {
 export async function batchDeleteApiKeys(
   ids: number[]
 ): Promise<ApiResponse<number>> {
-  const res = await api.post('/api/token/batch', { ids })
+  const endpoint = isAdminRequest()
+    ? '/api/token/admin/batch'
+    : '/api/token/batch'
+  const res = await api.post(endpoint, { ids })
   return res.data
 }
 
@@ -95,7 +115,10 @@ export async function updateApiKeyStatus(
   id: number,
   status: number
 ): Promise<ApiResponse<ApiKey>> {
-  const res = await api.put('/api/token/?status_only=true', { id, status })
+  const endpoint = isAdminRequest()
+    ? '/api/token/admin/?status_only=true'
+    : '/api/token/?status_only=true'
+  const res = await api.put(endpoint, { id, status })
   return res.data
 }
 
@@ -103,7 +126,10 @@ export async function updateApiKeyStatus(
 export async function fetchTokenKey(
   id: number
 ): Promise<{ success: boolean; message?: string; data?: { key: string } }> {
-  const res = await api.post(`/api/token/${id}/key`)
+  const endpoint = isAdminRequest()
+    ? `/api/token/admin/${id}/key`
+    : `/api/token/${id}/key`
+  const res = await api.post(endpoint)
   return res.data
 }
 
@@ -113,6 +139,9 @@ export async function fetchTokenKeysBatch(ids: number[]): Promise<{
   message?: string
   data?: { keys: Record<number, string> }
 }> {
-  const res = await api.post('/api/token/batch/keys', { ids })
+  const endpoint = isAdminRequest()
+    ? '/api/token/admin/batch/keys'
+    : '/api/token/batch/keys'
+  const res = await api.post(endpoint, { ids })
   return res.data
 }
