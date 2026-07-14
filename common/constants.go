@@ -158,6 +158,10 @@ var AutomaticEnableChannelEnabled = false
 var QuotaRemindThreshold = 1000
 var PreConsumedQuota = 500
 
+var TrustQuotaMinUSD = 10.0
+var TrustQuotaDynamicEnabled = false
+var TrustQuotaDynamicFactor = 1.5
+
 var RetryTimes = 0
 
 //var RootUserEmail = ""

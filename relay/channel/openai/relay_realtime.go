@@ -236,7 +236,12 @@ func preConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.R
 	totalUsage.InputTokenDetails.AudioTokens += usage.InputTokenDetails.AudioTokens
 	totalUsage.OutputTokenDetails.TextTokens += usage.OutputTokenDetails.TextTokens
 	totalUsage.OutputTokenDetails.AudioTokens += usage.OutputTokenDetails.AudioTokens
-	// clear usage
-	err := service.PreWssConsumeQuota(ctx, info, usage)
+	quotaUsage := usage
+	if common.TrustQuotaDynamicEnabled && info.Billing != nil {
+		// Dynamic reservations track the request's cumulative usage. Static mode
+		// keeps the existing per-batch deduction behavior for compatibility.
+		quotaUsage = totalUsage
+	}
+	err := service.PreWssConsumeQuota(ctx, info, quotaUsage)
 	return err
 }

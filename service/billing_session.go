@@ -1,10 +1,12 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -29,6 +31,7 @@ type BillingSession struct {
 	tokenConsumed    int  // 令牌额度实际扣减量
 	extraReserved    int  // 发送前补充预扣的额度（订阅退款时需要单独回滚）
 	trusted          bool // 是否命中信任额度旁路
+	dynamicTrust     *dynamicTrustReservation
 	fundingSettled   bool // funding.Settle 已成功，资金来源已提交
 	settled          bool // Settle 全部完成（资金 + 令牌）
 	refunded         bool // Refund 已调用
@@ -46,12 +49,14 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	}
 	delta := actualQuota - s.preConsumedQuota
 	if delta == 0 {
+		s.finalizeDynamicTrust(actualQuota)
 		s.settled = true
 		return nil
 	}
 	// 1) 调整资金来源（仅在尚未提交时执行，防止重复调用）
 	if !s.fundingSettled {
 		if err := s.funding.Settle(delta); err != nil {
+			s.abandonDynamicTrust()
 			return err
 		}
 		s.fundingSettled = true
@@ -68,14 +73,36 @@ func (s *BillingSession) Settle(actualQuota int) error {
 			// 资金来源已提交，令牌调整失败只能记录日志；标记 settled 防止 Refund 误退资金
 			common.SysLog(fmt.Sprintf("error adjusting token quota after funding settled (userId=%d, tokenId=%d, delta=%d): %s",
 				s.relayInfo.UserId, s.relayInfo.TokenId, delta, tokenErr.Error()))
+			s.abandonDynamicTrust()
 		}
 	}
 	// 3) 更新 relayInfo 上的订阅 PostDelta（用于日志）
 	if s.funding.Source() == BillingSourceSubscription {
 		s.relayInfo.SubscriptionPostDelta += int64(delta)
 	}
+	if tokenErr == nil {
+		s.finalizeDynamicTrust(actualQuota)
+	}
 	s.settled = true
 	return tokenErr
+}
+
+func (s *BillingSession) finalizeDynamicTrust(actualQuota int) {
+	if s.dynamicTrust == nil {
+		return
+	}
+	s.dynamicTrust.stopHeartbeat()
+	grace := time.Duration(common.BatchUpdateInterval+2) * time.Second
+	if err := s.dynamicTrust.store.Settle(context.Background(), s.dynamicTrust, actualQuota, grace); err != nil {
+		common.SysLog(fmt.Sprintf("failed to settle dynamic trust reservation (userId=%d, tokenId=%d, requestId=%s): %s",
+			s.dynamicTrust.userID, s.dynamicTrust.tokenID, s.dynamicTrust.requestID, err.Error()))
+	}
+}
+
+func (s *BillingSession) abandonDynamicTrust() {
+	if s.dynamicTrust != nil {
+		s.dynamicTrust.stopHeartbeat()
+	}
 }
 
 // Refund 退还所有预扣费，幂等安全，异步执行。
@@ -86,7 +113,17 @@ func (s *BillingSession) Refund(c *gin.Context) {
 		return
 	}
 	s.refunded = true
+	dynamicTrust := s.dynamicTrust
+	if dynamicTrust != nil {
+		dynamicTrust.stopHeartbeat()
+	}
 	s.mu.Unlock()
+	if dynamicTrust != nil {
+		if err := dynamicTrust.store.Release(context.Background(), dynamicTrust); err != nil {
+			common.SysLog(fmt.Sprintf("failed to release dynamic trust reservation (userId=%d, tokenId=%d, requestId=%s): %s",
+				dynamicTrust.userID, dynamicTrust.tokenID, dynamicTrust.requestID, err.Error()))
+		}
+	}
 
 	logger.LogInfo(c, fmt.Sprintf("用户 %d 请求失败, 返还预扣费（token_quota=%s, funding=%s）",
 		s.relayInfo.UserId,
@@ -137,6 +174,9 @@ func (s *BillingSession) needsRefundLocked() bool {
 	if s.tokenConsumed > 0 {
 		return true
 	}
+	if s.dynamicTrust != nil {
+		return true
+	}
 	// 订阅可能在 tokenConsumed=0 时仍预扣了额度
 	if sub, ok := s.funding.(*SubscriptionFunding); ok && sub.preConsumed > 0 {
 		return true
@@ -153,8 +193,26 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.settled || s.refunded || s.trusted || targetQuota <= s.preConsumedQuota {
+	if s.settled || s.refunded || targetQuota <= s.preConsumedQuota {
 		return nil
+	}
+	if s.trusted {
+		if s.dynamicTrust == nil || targetQuota <= s.dynamicTrust.amount {
+			return nil
+		}
+		decision, err := s.dynamicTrust.store.Resize(context.Background(), s.dynamicTrust, targetQuota)
+		if err == nil && decision.Trusted {
+			return nil
+		}
+		if err != nil {
+			common.SysLog(fmt.Sprintf("dynamic trust resize failed, falling back to pre-consume (userId=%d, tokenId=%d, requestId=%s): %s",
+				s.dynamicTrust.userID, s.dynamicTrust.tokenID, s.dynamicTrust.requestID, err.Error()))
+		} else {
+			common.SysLog(fmt.Sprintf("dynamic trust threshold reached, falling back to pre-consume (userId=%d, tokenId=%d, requestId=%s, userThreshold=%s, tokenThreshold=%s)",
+				s.dynamicTrust.userID, s.dynamicTrust.tokenID, s.dynamicTrust.requestID,
+				logger.FormatQuota(decision.UserThreshold), logger.FormatQuota(decision.TokenThreshold)))
+		}
+		return s.preConsumeDynamicTrustFallback(targetQuota)
 	}
 
 	delta := targetQuota - s.preConsumedQuota
@@ -177,6 +235,48 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 	return nil
 }
 
+// preConsumeDynamicTrustFallback converts an in-flight trusted request to the
+// normal pre-consume path when Redis is unavailable or its threshold is hit.
+func (s *BillingSession) preConsumeDynamicTrustFallback(targetQuota int) error {
+	if wallet, ok := s.funding.(*WalletFunding); ok {
+		userQuota, err := model.GetUserQuota(wallet.userId, false)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
+		}
+		if userQuota < targetQuota {
+			return types.NewErrorWithStatusCode(
+				fmt.Errorf("用户额度不足, 剩余额度: %s, 需要预扣费额度: %s", logger.FormatQuota(userQuota), logger.FormatQuota(targetQuota)),
+				types.ErrorCodeInsufficientUserQuota,
+				http.StatusForbidden,
+				types.ErrOptionWithSkipRetry(),
+				types.ErrOptionWithNoRecordErrorLog(),
+			)
+		}
+	}
+	if err := s.funding.PreConsume(targetQuota); err != nil {
+		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+	}
+	if err := s.reserveToken(targetQuota); err != nil {
+		s.rollbackFundingReserve(targetQuota)
+		return err
+	}
+
+	reservation := s.dynamicTrust
+	reservation.stopHeartbeat()
+	s.preConsumedQuota = targetQuota
+	s.tokenConsumed = targetQuota
+	s.extraReserved += targetQuota
+	s.trusted = false
+	s.dynamicTrust = nil
+	s.syncRelayInfo()
+
+	if err := reservation.store.Release(context.Background(), reservation); err != nil {
+		common.SysLog(fmt.Sprintf("failed to release dynamic trust reservation after pre-consume fallback (userId=%d, tokenId=%d, requestId=%s): %s",
+			reservation.userID, reservation.tokenID, reservation.requestID, err.Error()))
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // PreConsume — 统一预扣费入口（含信任额度旁路）
 // ---------------------------------------------------------------------------
@@ -187,7 +287,7 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	effectiveQuota := quota
 
 	// ---- 信任额度旁路 ----
-	if s.shouldTrust(c) {
+	if s.shouldTrust(c, quota) {
 		s.trusted = true
 		effectiveQuota = 0
 		logger.LogInfo(c, fmt.Sprintf("用户 %d 额度充足, 信任且不需要预扣费 (funding=%s)", s.relayInfo.UserId, s.funding.Source()))
@@ -232,6 +332,19 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 func (s *BillingSession) reserveFunding(delta int) error {
 	switch funding := s.funding.(type) {
 	case *WalletFunding:
+		userQuota, err := model.GetUserQuota(funding.userId, false)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
+		}
+		if userQuota < delta {
+			return types.NewErrorWithStatusCode(
+				fmt.Errorf("用户额度不足, 剩余额度: %s, 需要预扣费额度: %s", logger.FormatQuota(userQuota), logger.FormatQuota(delta)),
+				types.ErrorCodeInsufficientUserQuota,
+				http.StatusForbidden,
+				types.ErrOptionWithSkipRetry(),
+				types.ErrOptionWithNoRecordErrorLog(),
+			)
+		}
 		if err := model.DecreaseUserQuota(funding.userId, delta, false); err != nil {
 			return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 		}
@@ -279,9 +392,9 @@ func (s *BillingSession) reserveToken(delta int) error {
 }
 
 // shouldTrust 统一信任额度检查，适用于钱包和订阅。
-func (s *BillingSession) shouldTrust(c *gin.Context) bool {
+func (s *BillingSession) shouldTrust(c *gin.Context, quota int) bool {
 	// 异步任务（ForcePreConsume=true）必须预扣全额，不允许信任旁路
-	if s.relayInfo.ForcePreConsume {
+	if s.relayInfo.ForcePreConsume || quota <= 0 || s.funding.Source() != BillingSourceWallet {
 		return false
 	}
 
@@ -290,28 +403,60 @@ func (s *BillingSession) shouldTrust(c *gin.Context) bool {
 		return false
 	}
 
-	// 检查令牌是否充足
-	tokenTrusted := s.relayInfo.TokenUnlimited
-	if !tokenTrusted {
-		tokenQuota := c.GetInt("token_quota")
-		tokenTrusted = tokenQuota > trustQuota
+	tokenQuota := c.GetInt("token_quota")
+	if !common.TrustQuotaDynamicEnabled {
+		if !s.relayInfo.TokenUnlimited && tokenQuota <= trustQuota {
+			return false
+		}
+		return s.relayInfo.UserQuota > trustQuota
 	}
-	if !tokenTrusted {
+
+	if !common.RedisEnabled || common.RDB == nil {
+		return false
+	}
+	requestID := s.relayInfo.RequestId
+	if requestID == "" {
+		requestID = common.NewRequestId()
+	}
+	store := dynamicTrustStoreFactory()
+	params := dynamicTrustAcquireParams{
+		RequestID:      requestID,
+		UserID:         s.relayInfo.UserId,
+		TokenID:        s.relayInfo.TokenId,
+		Amount:         quota,
+		UserQuota:      s.relayInfo.UserQuota,
+		TokenQuota:     tokenQuota,
+		TokenUnlimited: s.relayInfo.TokenUnlimited,
+		MinQuota:       trustQuota,
+		FactorMillis:   common.GetTrustQuotaDynamicFactorMillis(),
+	}
+	decision, err := store.Acquire(c.Request.Context(), params)
+	if err != nil {
+		logger.LogWarn(c, fmt.Sprintf("dynamic trust unavailable, falling back to pre-consume: %s", err.Error()))
+		return false
+	}
+	if !decision.Trusted {
+		logger.LogDebug(c, "dynamic trust denied: user_threshold=%d token_threshold=%d user_pending=%d token_pending=%d",
+			decision.UserThreshold, decision.TokenThreshold, decision.UserPending, decision.TokenPending)
 		return false
 	}
 
-	switch s.funding.Source() {
-	case BillingSourceWallet:
-		return s.relayInfo.UserQuota > trustQuota
-	case BillingSourceSubscription:
-		// 订阅不能启用信任旁路。原因：
-		// 1. PreConsumeUserSubscription 要求 amount>0 来创建预扣记录并锁定订阅
-		// 2. SubscriptionFunding.PreConsume 忽略参数，始终用 s.amount 预扣
-		// 3. 若信任旁路将 effectiveQuota 设为 0，会导致 preConsumedQuota 与实际订阅预扣不一致
-		return false
-	default:
-		return false
+	s.dynamicTrust = &dynamicTrustReservation{
+		store:          store,
+		requestID:      requestID,
+		userID:         s.relayInfo.UserId,
+		tokenID:        s.relayInfo.TokenId,
+		amount:         quota,
+		userQuota:      s.relayInfo.UserQuota,
+		tokenQuota:     tokenQuota,
+		tokenUnlimited: s.relayInfo.TokenUnlimited,
+		minQuota:       trustQuota,
+		factorMillis:   common.GetTrustQuotaDynamicFactorMillis(),
 	}
+	s.dynamicTrust.startHeartbeat()
+	logger.LogDebug(c, "dynamic trust granted: user_threshold=%d token_threshold=%d user_pending=%d token_pending=%d",
+		decision.UserThreshold, decision.TokenThreshold, decision.UserPending, decision.TokenPending)
+	return true
 }
 
 // syncRelayInfo 将 BillingSession 的状态同步到 RelayInfo 的兼容字段上。
