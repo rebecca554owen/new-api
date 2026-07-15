@@ -162,6 +162,10 @@ var TrustQuotaMinUSD = 10.0
 var TrustQuotaDynamicEnabled = false
 var TrustQuotaDynamicFactor = 1.5
 
+var PreConsumeStrictEnabled = false
+var PreConsumeAtomicEnabled = false
+var PreConsumeDefaultMaxTokens = 8192
+
 var RetryTimes = 0
 
 //var RootUserEmail = ""

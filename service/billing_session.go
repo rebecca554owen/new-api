@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -32,6 +33,7 @@ type BillingSession struct {
 	extraReserved    int  // 发送前补充预扣的额度（订阅退款时需要单独回滚）
 	trusted          bool // 是否命中信任额度旁路
 	dynamicTrust     *dynamicTrustReservation
+	atomicQuota      *model.AtomicQuotaReservation
 	fundingSettled   bool // funding.Settle 已成功，资金来源已提交
 	settled          bool // Settle 全部完成（资金 + 令牌）
 	refunded         bool // Refund 已调用
@@ -45,6 +47,21 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.settled {
+		return nil
+	}
+	s.relayInfo.ActualQuota = actualQuota
+	if s.atomicQuota != nil {
+		result, err := model.SettleAtomicQuota(s.atomicQuota, actualQuota)
+		s.recordAtomicQuotaResult(result)
+		if err != nil {
+			return err
+		}
+		if actualQuota > s.preConsumedQuota {
+			common.SysLog(fmt.Sprintf("strict pre-consume estimate exceeded (userId=%d, tokenId=%d, requestId=%s, actual=%d, preConsumed=%d)",
+				s.relayInfo.UserId, s.relayInfo.TokenId, s.relayInfo.RequestId, actualQuota, s.preConsumedQuota))
+		}
+		s.fundingSettled = true
+		s.settled = true
 		return nil
 	}
 	delta := actualQuota - s.preConsumedQuota
@@ -114,6 +131,7 @@ func (s *BillingSession) Refund(c *gin.Context) {
 	}
 	s.refunded = true
 	dynamicTrust := s.dynamicTrust
+	atomicQuota := s.atomicQuota
 	if dynamicTrust != nil {
 		dynamicTrust.stopHeartbeat()
 	}
@@ -123,6 +141,21 @@ func (s *BillingSession) Refund(c *gin.Context) {
 			common.SysLog(fmt.Sprintf("failed to release dynamic trust reservation (userId=%d, tokenId=%d, requestId=%s): %s",
 				dynamicTrust.userID, dynamicTrust.tokenID, dynamicTrust.requestID, err.Error()))
 		}
+	}
+	if atomicQuota != nil {
+		gopool.Go(func() {
+			var lastErr error
+			for attempt := 0; attempt < 3; attempt++ {
+				_, err := model.RefundAtomicQuota(atomicQuota)
+				if err == nil {
+					return
+				}
+				lastErr = err
+			}
+			common.SysLog(fmt.Sprintf("failed to refund atomic quota reservation (userId=%d, tokenId=%d, requestId=%s): %s",
+				atomicQuota.UserID, atomicQuota.TokenID, atomicQuota.RequestID, lastErr.Error()))
+		})
+		return
 	}
 
 	logger.LogInfo(c, fmt.Sprintf("用户 %d 请求失败, 返还预扣费（token_quota=%s, funding=%s）",
@@ -177,6 +210,9 @@ func (s *BillingSession) needsRefundLocked() bool {
 	if s.dynamicTrust != nil {
 		return true
 	}
+	if s.atomicQuota != nil {
+		return true
+	}
 	// 订阅可能在 tokenConsumed=0 时仍预扣了额度
 	if sub, ok := s.funding.(*SubscriptionFunding); ok && sub.preConsumed > 0 {
 		return true
@@ -194,6 +230,19 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 	defer s.mu.Unlock()
 
 	if s.settled || s.refunded || targetQuota <= s.preConsumedQuota {
+		return nil
+	}
+	if s.atomicQuota != nil {
+		result, err := model.ResizeAtomicQuota(s.atomicQuota, targetQuota)
+		s.recordAtomicQuotaResult(result)
+		if err != nil {
+			return err
+		}
+		delta := targetQuota - s.preConsumedQuota
+		s.preConsumedQuota = targetQuota
+		s.tokenConsumed += delta
+		s.extraReserved += delta
+		s.syncRelayInfo()
 		return nil
 	}
 	if s.trusted {
@@ -238,6 +287,20 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 // preConsumeDynamicTrustFallback converts an in-flight trusted request to the
 // normal pre-consume path when Redis is unavailable or its threshold is hit.
 func (s *BillingSession) preConsumeDynamicTrustFallback(targetQuota int) error {
+	if common.PreConsumeAtomicEnabled && s.funding.Source() == BillingSourceWallet {
+		if err := s.acquireAtomicQuota(targetQuota); err != nil {
+			return err
+		}
+		reservation := s.dynamicTrust
+		reservation.stopHeartbeat()
+		s.trusted = false
+		s.dynamicTrust = nil
+		if err := reservation.store.Release(context.Background(), reservation); err != nil {
+			common.SysLog(fmt.Sprintf("failed to release dynamic trust reservation after atomic pre-consume fallback (userId=%d, tokenId=%d, requestId=%s): %s",
+				reservation.userID, reservation.tokenID, reservation.requestID, err.Error()))
+		}
+		return nil
+	}
 	if wallet, ok := s.funding.(*WalletFunding); ok {
 		userQuota, err := model.GetUserQuota(wallet.userId, false)
 		if err != nil {
@@ -294,6 +357,12 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	} else if effectiveQuota > 0 {
 		logger.LogInfo(c, fmt.Sprintf("用户 %d 需要预扣费 %s (funding=%s)", s.relayInfo.UserId, logger.FormatQuota(effectiveQuota), s.funding.Source()))
 	}
+	if effectiveQuota > 0 && common.PreConsumeAtomicEnabled && s.funding.Source() == BillingSourceWallet {
+		if err := s.acquireAtomicQuota(effectiveQuota); err != nil {
+			return atomicQuotaAPIError(err)
+		}
+		return nil
+	}
 
 	// ---- 1) 预扣令牌额度 ----
 	if effectiveQuota > 0 {
@@ -327,6 +396,57 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	s.syncRelayInfo()
 
 	return nil
+}
+
+func (s *BillingSession) acquireAtomicQuota(quota int) error {
+	requestID := s.relayInfo.RequestId
+	if requestID == "" {
+		requestID = common.NewRequestId()
+		s.relayInfo.RequestId = requestID
+	}
+	reservation := &model.AtomicQuotaReservation{
+		RequestID:      requestID,
+		UserID:         s.relayInfo.UserId,
+		TokenID:        s.relayInfo.TokenId,
+		TokenKey:       s.relayInfo.TokenKey,
+		TokenUnlimited: s.relayInfo.TokenUnlimited || s.relayInfo.IsPlayground,
+		Amount:         quota,
+	}
+	result, err := model.AcquireAtomicQuota(reservation)
+	s.recordAtomicQuotaResult(result)
+	s.relayInfo.AtomicPreConsumeDurationMs = result.Duration.Milliseconds()
+	if err != nil {
+		return err
+	}
+	s.atomicQuota = reservation
+	s.preConsumedQuota = quota
+	s.tokenConsumed = quota
+	s.relayInfo.AtomicPreConsume = true
+	s.syncRelayInfo()
+	return nil
+}
+
+func (s *BillingSession) recordAtomicQuotaResult(result model.AtomicQuotaResult) {
+	if s == nil || s.relayInfo == nil {
+		return
+	}
+	if result.Status != "" {
+		s.relayInfo.BillingReservationResult = result.Status
+	}
+}
+
+func atomicQuotaAPIError(err error) *types.NewAPIError {
+	switch {
+	case errors.Is(err, model.ErrAtomicUserQuotaInsufficient):
+		return types.NewErrorWithStatusCode(err, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden,
+			types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+	case errors.Is(err, model.ErrAtomicTokenQuotaInsufficient):
+		return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden,
+			types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+	default:
+		return types.NewErrorWithStatusCode(err, types.ErrorCodeBillingServiceUnavailable, http.StatusServiceUnavailable,
+			types.ErrOptionWithSkipRetry())
+	}
 }
 
 func (s *BillingSession) reserveFunding(delta int) error {
@@ -395,6 +515,9 @@ func (s *BillingSession) reserveToken(delta int) error {
 func (s *BillingSession) shouldTrust(c *gin.Context, quota int) bool {
 	// 异步任务（ForcePreConsume=true）必须预扣全额，不允许信任旁路
 	if s.relayInfo.ForcePreConsume || quota <= 0 || s.funding.Source() != BillingSourceWallet {
+		return false
+	}
+	if common.PreConsumeAtomicEnabled && !common.TrustQuotaDynamicEnabled {
 		return false
 	}
 
@@ -497,13 +620,13 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 		if err != nil {
 			return nil, types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
 		}
-		if userQuota <= 0 {
+		if !common.PreConsumeAtomicEnabled && userQuota <= 0 {
 			return nil, types.NewErrorWithStatusCode(
 				fmt.Errorf("用户额度不足, 剩余额度: %s", logger.FormatQuota(userQuota)),
 				types.ErrorCodeInsufficientUserQuota, http.StatusForbidden,
 				types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		}
-		if userQuota-preConsumedQuota < 0 {
+		if !common.PreConsumeAtomicEnabled && userQuota-preConsumedQuota < 0 {
 			return nil, types.NewErrorWithStatusCode(
 				fmt.Errorf("预扣费额度失败, 用户剩余额度: %s, 需要预扣费额度: %s", logger.FormatQuota(userQuota), logger.FormatQuota(preConsumedQuota)),
 				types.ErrorCodeInsufficientUserQuota, http.StatusForbidden,

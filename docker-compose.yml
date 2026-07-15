@@ -39,6 +39,9 @@ services:
 #      - TRUST_QUOTA_MIN_USD=10  # 最低信任余额（美元）；0 表示关闭信任旁路 (Minimum trusted wallet balance in USD; 0 disables the trust bypass)
 #      - TRUST_QUOTA_DYNAMIC_ENABLED=false  # 动态信任额度依赖 Redis，默认关闭 (Enable Redis-backed dynamic trust quota; disabled by default)
 #      - TRUST_QUOTA_DYNAMIC_FACTOR=1.5  # 动态信任额度安全系数，范围 1.0-10.0 (Dynamic trust quota safety factor, range 1.0-10.0)
+#      - PRE_CONSUME_STRICT_ENABLED=false  # 严格按最大输出费用预扣 (Reserve the bounded maximum output cost)
+#      - PRE_CONSUME_ATOMIC_ENABLED=false  # 使用 Redis 原子预扣，Redis 故障时拒绝付费钱包请求 (Use Redis atomic reservation)
+#      - PRE_CONSUME_DEFAULT_MAX_TOKENS=8192  # 未提供输出上限时的计费及转发上限 (Default billed and forwarded output limit)
 #      - STREAMING_TIMEOUT=300  # 流模式无响应超时时间，单位秒，默认120秒，如果出现空补全可以尝试改为更大值 （Streaming timeout in seconds, default is 120s. Increase if experiencing empty completions）
 #      - RELAY_IDLE_CONN_TIMEOUT=90  # Relay HTTP 客户端空闲连接超时时间，单位秒，默认跟随 Go 标准库，设置为0表示不限制 (Relay HTTP client idle keep-alive timeout in seconds, defaults to Go standard library; set 0 to disable)
 #      - SESSION_SECRET=random_string  # 多机部署时设置，必须修改这个随机字符串！！ （multi-node deployment, set this to a random string!!!!!!!）

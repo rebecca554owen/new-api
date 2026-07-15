@@ -2,6 +2,7 @@ package helper
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -91,10 +92,6 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 	var audioCompletionRatio float64
 	var freeModel bool
 	if !usePrice {
-		preConsumedTokens := common.Max(promptTokens, common.PreConsumedQuota)
-		if meta.MaxTokens != 0 {
-			preConsumedTokens += meta.MaxTokens
-		}
 		var success bool
 		var matchName string
 		modelRatio, success, matchName = ratio_setting.GetModelRatio(info.OriginModelName)
@@ -116,12 +113,18 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		imageRatio, _ = ratio_setting.GetImageRatio(info.OriginModelName)
 		audioRatio = ratio_setting.GetAudioRatio(info.OriginModelName)
 		audioCompletionRatio = ratio_setting.GetAudioCompletionRatio(info.OriginModelName)
-		ratio := modelRatio * groupRatioInfo.GroupRatio
-		quota, err := common.QuotaFromFloatStrict(float64(preConsumedTokens) * ratio)
-		if err != nil {
-			return types.PriceData{}, err
+		preConsumedTokens := common.Max(promptTokens, common.PreConsumedQuota)
+		if !common.PreConsumeStrictEnabled {
+			if meta.MaxTokens != 0 {
+				preConsumedTokens += meta.MaxTokens
+			}
+			ratio := modelRatio * groupRatioInfo.GroupRatio
+			quota, err := common.QuotaFromFloatStrict(float64(preConsumedTokens) * ratio)
+			if err != nil {
+				return types.PriceData{}, err
+			}
+			preConsumedQuota = quota
 		}
-		preConsumedQuota = quota
 	} else {
 		if meta.ImagePriceRatio != 0 {
 			modelPrice = modelPrice * meta.ImagePriceRatio
@@ -163,10 +166,26 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		CacheCreation1hRatio: cacheCreationRatio1h,
 		QuotaToPreConsume:    preConsumedQuota,
 	}
-	if usePrice {
+	if usePrice || common.PreConsumeStrictEnabled {
 		for name, ratio := range meta.BillingRatios {
 			priceData.AddOtherRatio(name, ratio)
 		}
+	}
+	if !usePrice && common.PreConsumeStrictEnabled {
+		inputRatio := math.Max(1, cacheRatio)
+		inputRatio = math.Max(inputRatio, cacheCreationRatio5m)
+		inputRatio = math.Max(inputRatio, cacheCreationRatio1h)
+		inputRatio = math.Max(inputRatio, imageRatio)
+		weightedTokens := float64(common.Max(promptTokens, common.PreConsumedQuota))*inputRatio +
+			float64(meta.MaxTokens)*completionRatio
+		quotaToPreConsume := priceData.ApplyOtherRatiosToFloat(weightedTokens * modelRatio * groupRatioInfo.GroupRatio)
+		quota, err := common.QuotaFromFloatStrict(quotaToPreConsume)
+		if err != nil {
+			return types.PriceData{}, err
+		}
+		priceData.QuotaToPreConsume = quota
+	}
+	if usePrice {
 		quotaToPreConsume := priceData.ApplyOtherRatiosToFloat(modelPrice * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
 		quota, err := common.QuotaFromFloatStrict(quotaToPreConsume)
 		if err != nil {

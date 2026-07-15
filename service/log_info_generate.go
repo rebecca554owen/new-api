@@ -162,6 +162,30 @@ func appendBillingInfo(relayInfo *relaycommon.RelayInfo, other map[string]interf
 	if relayInfo.UserSetting.BillingPreference != "" {
 		other["billing_preference"] = relayInfo.UserSetting.BillingPreference
 	}
+	adminInfo, ok := other["admin_info"].(map[string]interface{})
+	if !ok || adminInfo == nil {
+		adminInfo = map[string]interface{}{}
+		other["admin_info"] = adminInfo
+	}
+	adminInfo["pre_consumed_quota"] = relayInfo.FinalPreConsumedQuota
+	adminInfo["estimated_preconsume_quota"] = relayInfo.PriceData.QuotaToPreConsume
+	adminInfo["actual_quota"] = relayInfo.ActualQuota
+	if relayInfo.ActualQuota > 0 {
+		adminInfo["preconsume_ratio"] = float64(relayInfo.PriceData.QuotaToPreConsume) / float64(relayInfo.ActualQuota)
+	}
+	if relayInfo.EffectiveMaxTokens > 0 {
+		adminInfo["effective_max_tokens"] = relayInfo.EffectiveMaxTokens
+	}
+	if relayInfo.StrictPreConsume {
+		adminInfo["strict_preconsume"] = true
+	}
+	if relayInfo.AtomicPreConsume {
+		adminInfo["atomic_preconsume"] = true
+		adminInfo["atomic_preconsume_duration_ms"] = relayInfo.AtomicPreConsumeDurationMs
+	}
+	if relayInfo.BillingReservationResult != "" {
+		adminInfo["billing_reservation_result"] = relayInfo.BillingReservationResult
+	}
 	if relayInfo.BillingSource == "subscription" {
 		if relayInfo.SubscriptionId != 0 {
 			other["subscription_id"] = relayInfo.SubscriptionId

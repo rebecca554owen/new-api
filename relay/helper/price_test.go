@@ -272,3 +272,36 @@ func TestModelPriceHelperRequestBillingRatiosOnlyApplyToFixedPrice(t *testing.T)
 	require.Equal(t, common.QuotaClampOverflow, clamp.Kind)
 	require.Nil(t, info.Billing)
 }
+
+func TestModelPriceHelperStrictPreConsumeAppliesCompletionAndInputRatios(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	savedModelPrices := ratio_setting.ModelPrice2JSONString()
+	savedModelRatios := ratio_setting.ModelRatio2JSONString()
+	savedCompletionRatios := ratio_setting.CompletionRatio2JSONString()
+	oldStrict := common.PreConsumeStrictEnabled
+	common.PreConsumeStrictEnabled = true
+	t.Cleanup(func() {
+		common.PreConsumeStrictEnabled = oldStrict
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedModelPrices))
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedModelRatios))
+		require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(savedCompletionRatios))
+	})
+
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"strict-completion-model":2}`))
+	require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(`{"strict-completion-model":6}`))
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set("group", "default")
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "strict-completion-model",
+		UserGroup:       "default",
+		UsingGroup:      "default",
+	}
+
+	priceData, err := ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{MaxTokens: 4000})
+
+	require.NoError(t, err)
+	// The strict input side uses the highest configured input/cache ratio (2 here):
+	// (1000 * 2 + 4000 maximum output * completion ratio 6) * model ratio 2.
+	require.Equal(t, 52000, priceData.QuotaToPreConsume)
+}

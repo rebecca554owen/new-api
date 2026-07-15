@@ -193,6 +193,18 @@ func TestDynamicTrustSkipsForcedPreConsume(t *testing.T) {
 	assert.Zero(t, store.acquireCalls)
 }
 
+func TestAtomicPreConsumeDisablesStaticTrustBypass(t *testing.T) {
+	store := &fakeDynamicTrustStore{decision: dynamicTrustDecision{Trusted: true}}
+	c, session := setupDynamicTrustTest(t, store)
+	oldAtomic := common.PreConsumeAtomicEnabled
+	common.PreConsumeAtomicEnabled = true
+	common.TrustQuotaDynamicEnabled = false
+	t.Cleanup(func() { common.PreConsumeAtomicEnabled = oldAtomic })
+
+	assert.False(t, session.shouldTrust(c, 1_000_000))
+	assert.Zero(t, store.acquireCalls)
+}
+
 func TestDynamicTrustReservationRefundReleasesOnce(t *testing.T) {
 	store := &fakeDynamicTrustStore{}
 	c, session := setupDynamicTrustTest(t, store)
