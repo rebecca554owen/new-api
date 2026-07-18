@@ -33,7 +33,7 @@ type internalAdminUpdateUserRequest struct {
 
 func InternalAdminListUsers(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.GetAllUsers(pageInfo, c.Query("order"))
+	users, total, err := model.GetAllUsers(pageInfo, getUserSortOptions(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -45,7 +45,7 @@ func InternalAdminListUsers(c *gin.Context) {
 
 func InternalAdminSearchUsers(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.SearchUsers(c.Query("keyword"), c.Query("group"), nil, nil, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), c.Query("order"))
+	users, total, err := model.SearchUsers(c.Query("keyword"), c.Query("group"), nil, nil, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), getUserSortOptions(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return

@@ -73,7 +73,13 @@ func Login(c *gin.Context) {
 	}
 
 	// 检查是否启用2FA
-	if model.IsTwoFAEnabled(user.Id) {
+	twoFAEnabled, err := model.IsTwoFAEnabled(user.Id)
+	if err != nil {
+		common.SysLog(fmt.Sprintf("Login failed to load 2FA status for user %d: %v", user.Id, err))
+		common.ApiErrorI18n(c, i18n.MsgDatabaseError)
+		return
+	}
+	if twoFAEnabled {
 		// 设置pending session，等待2FA验证
 		session := sessions.Default(c)
 		session.Set("pending_username", user.Username)
@@ -302,7 +308,8 @@ func Register(c *gin.Context) {
 
 func GetAllUsers(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.GetAllUsers(pageInfo, c.Query("order"))
+	sortOptions := getUserSortOptions(c)
+	users, total, err := model.GetAllUsers(pageInfo, sortOptions)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -329,7 +336,8 @@ func SearchUsers(c *gin.Context) {
 		}
 	}
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.SearchUsers(keyword, group, role, status, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), c.Query("order"))
+	sortOptions := getUserSortOptions(c)
+	users, total, err := model.SearchUsers(keyword, group, role, status, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), sortOptions)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -338,6 +346,19 @@ func SearchUsers(c *gin.Context) {
 	pageInfo.SetItems(users)
 	common.ApiSuccess(c, pageInfo)
 	return
+}
+
+func getUserSortOptions(c *gin.Context) model.UserSortOptions {
+	sortBy := c.Query("sort_by")
+	sortOrder := c.Query("sort_order")
+	if strings.TrimSpace(sortBy) == "" {
+		switch strings.ToLower(strings.TrimSpace(c.Query("order"))) {
+		case "id_asc", "asc", "id asc":
+			sortBy = "id"
+			sortOrder = "asc"
+		}
+	}
+	return model.NewUserSortOptions(sortBy, sortOrder)
 }
 
 func canManageTargetRole(myRole int, targetRole int) bool {
