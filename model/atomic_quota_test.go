@@ -36,7 +36,9 @@ func setupAtomicQuotaTest(t *testing.T, userQuota, tokenQuota int) *AtomicQuotaR
 
 	userID := 901
 	token := &Token{Id: 902, UserId: userID, Key: "atomic-quota-token", RemainQuota: tokenQuota}
-	require.NoError(t, common.RedisHSetObj(getUserCacheKey(userID), &UserBase{Id: userID, Quota: userQuota}, 0))
+	require.NoError(t, common.RedisHSetObj(getUserCacheKey(userID), &UserBase{
+		Id: userID, Quota: userQuota, AuthVersion: 1, CacheSchema: userCacheSchemaVersion,
+	}, 0))
 	require.NoError(t, cacheSetToken(*token))
 	return &AtomicQuotaReservation{
 		RequestID: "atomic-request",

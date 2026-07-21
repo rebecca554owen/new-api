@@ -397,7 +397,6 @@ func GetLogsSelfStat(c *gin.Context) {
 	})
 	return
 }
-
 // DeleteHistoryLogs is the legacy synchronous log cleanup endpoint (DELETE /api/log/).
 // It deletes directly instead of going through the async system task. It is kept only
 // for the classic frontend; the default frontend uses POST /api/system-task/log-cleanup.
