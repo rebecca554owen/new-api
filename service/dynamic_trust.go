@@ -23,9 +23,8 @@ type dynamicTrustAcquireParams struct {
 	RequestID      string
 	UserID         int
 	TokenID        int
+	TokenKey       string
 	Amount         int
-	UserQuota      int
-	TokenQuota     int
 	TokenUnlimited bool
 	MinQuota       int
 	FactorMillis   int64
@@ -52,9 +51,8 @@ type dynamicTrustReservation struct {
 	requestID       string
 	userID          int
 	tokenID         int
+	tokenKey        string
 	amount          int
-	userQuota       int
-	tokenQuota      int
 	tokenUnlimited  bool
 	minQuota        int
 	factorMillis    int64
@@ -98,8 +96,16 @@ func newRedisDynamicTrustStore() dynamicTrustStore {
 var dynamicTrustStoreFactory = newRedisDynamicTrustStore
 
 func dynamicTrustKeys(userID int) []string {
-	base := fmt.Sprintf("trust:pending:{%d}", userID)
-	return []string{base + ":expires", base + ":requests", base + ":totals"}
+	return common.DynamicTrustRedisKeys(userID)
+}
+
+func dynamicTrustDecisionKeys(userID int, tokenKey string, tokenUnlimited bool) []string {
+	keys := dynamicTrustKeys(userID)
+	keys = append(keys, fmt.Sprintf("user:%d", userID))
+	if tokenUnlimited {
+		return append(keys, "billing:dynamic:unlimited")
+	}
+	return append(keys, fmt.Sprintf("token:%s", common.GenerateHMAC(tokenKey)))
 }
 
 var dynamicTrustAcquireScript = redis.NewScript(`
@@ -123,11 +129,9 @@ local now = tonumber(ARGV[1])
 local lease = tonumber(ARGV[2])
 local id = ARGV[3]
 local amount = tonumber(ARGV[4])
-local userQuota = tonumber(ARGV[5])
-local token = ARGV[6]
-local tokenQuota = tonumber(ARGV[7])
-local minQuota = tonumber(ARGV[8])
-local factor = tonumber(ARGV[9])
+local token = ARGV[5]
+local minQuota = tonumber(ARGV[6])
+local factor = tonumber(ARGV[7])
 cleanup(now)
 
 local existing = redis.call('HGET', KEYS[2], id .. ':amount')
@@ -138,6 +142,14 @@ if existing then
   redis.call('PEXPIRE', KEYS[3], lease * 2)
   return {2, 0, 0, tonumber(redis.call('HGET', KEYS[3], 'user')) or 0,
     tonumber(redis.call('HGET', KEYS[3], 'token:' .. token)) or 0}
+end
+
+local userQuota = tonumber(redis.call('HGET', KEYS[4], 'Quota'))
+if not userQuota then return {-2, 0, 0, 0, 0} end
+local tokenQuota = 0
+if token ~= '0' then
+  tokenQuota = tonumber(redis.call('HGET', KEYS[5], 'RemainQuota'))
+  if not tokenQuota then return {-3, 0, 0, 0, 0} end
 end
 
 local userPending = tonumber(redis.call('HGET', KEYS[3], 'user')) or 0
@@ -174,10 +186,8 @@ local now = tonumber(ARGV[1])
 local lease = tonumber(ARGV[2])
 local id = ARGV[3]
 local target = tonumber(ARGV[4])
-local userQuota = tonumber(ARGV[5])
-local tokenQuota = tonumber(ARGV[6])
-local minQuota = tonumber(ARGV[7])
-local factor = tonumber(ARGV[8])
+local minQuota = tonumber(ARGV[5])
+local factor = tonumber(ARGV[6])
 local old = tonumber(redis.call('HGET', KEYS[2], id .. ':amount'))
 if not old then return {-1, 0, 0, 0, 0} end
 local token = redis.call('HGET', KEYS[2], id .. ':token') or '0'
@@ -186,7 +196,13 @@ if target <= old then
   return {1, 0, 0, tonumber(redis.call('HGET', KEYS[3], 'user')) or 0,
     tonumber(redis.call('HGET', KEYS[3], 'token:' .. token)) or 0}
 end
-
+local userQuota = tonumber(redis.call('HGET', KEYS[4], 'Quota'))
+if not userQuota then return {-2, 0, 0, 0, 0} end
+local tokenQuota = 0
+if token ~= '0' then
+  tokenQuota = tonumber(redis.call('HGET', KEYS[5], 'RemainQuota'))
+  if not tokenQuota then return {-3, 0, 0, 0, 0} end
+end
 local delta = target - old
 local prospectiveUser = (tonumber(redis.call('HGET', KEYS[3], 'user')) or 0) + delta
 local userThreshold = math.floor((prospectiveUser * factor + 999) / 1000)
@@ -265,14 +281,13 @@ func (s *redisDynamicTrustStore) Acquire(ctx context.Context, params dynamicTrus
 		return dynamicTrustDecision{}, errors.New("redis client is unavailable")
 	}
 	tokenID := params.TokenID
-	tokenQuota := params.TokenQuota
 	if params.TokenUnlimited {
 		tokenID = 0
-		tokenQuota = 0
 	}
-	result, err := s.runDecisionScript(ctx, dynamicTrustAcquireScript, params.UserID,
+	result, err := s.runDecisionScript(ctx, dynamicTrustAcquireScript,
+		dynamicTrustDecisionKeys(params.UserID, params.TokenKey, params.TokenUnlimited),
 		time.Now().UnixMilli(), dynamicTrustLease.Milliseconds(), params.RequestID, params.Amount,
-		params.UserQuota, tokenID, tokenQuota, params.MinQuota, params.FactorMillis)
+		tokenID, params.MinQuota, params.FactorMillis)
 	if err != nil {
 		return dynamicTrustDecision{}, err
 	}
@@ -283,9 +298,10 @@ func (s *redisDynamicTrustStore) Resize(ctx context.Context, reservation *dynami
 	if reservation == nil {
 		return dynamicTrustDecision{}, errors.New("dynamic trust reservation is nil")
 	}
-	decision, err := s.runDecisionScript(ctx, dynamicTrustResizeScript, reservation.userID,
+	decision, err := s.runDecisionScript(ctx, dynamicTrustResizeScript,
+		dynamicTrustDecisionKeys(reservation.userID, reservation.tokenKey, reservation.tokenUnlimited),
 		time.Now().UnixMilli(), dynamicTrustLease.Milliseconds(), reservation.requestID, targetQuota,
-		reservation.userQuota, reservation.tokenQuota, reservation.minQuota, reservation.factorMillis)
+		reservation.minQuota, reservation.factorMillis)
 	if err != nil {
 		return dynamicTrustDecision{}, err
 	}
@@ -346,10 +362,10 @@ func (s *redisDynamicTrustStore) Release(ctx context.Context, reservation *dynam
 	return err
 }
 
-func (s *redisDynamicTrustStore) runDecisionScript(ctx context.Context, script *redis.Script, userID int, args ...interface{}) (dynamicTrustDecision, error) {
+func (s *redisDynamicTrustStore) runDecisionScript(ctx context.Context, script *redis.Script, keys []string, args ...interface{}) (dynamicTrustDecision, error) {
 	ctx, cancel := context.WithTimeout(ctx, dynamicTrustRedisTimeout)
 	defer cancel()
-	values, err := script.Run(ctx, s.client, dynamicTrustKeys(userID), args...).Slice()
+	values, err := script.Run(ctx, s.client, keys, args...).Slice()
 	if err != nil {
 		return dynamicTrustDecision{}, err
 	}
@@ -371,8 +387,17 @@ func (s *redisDynamicTrustStore) runDecisionScript(ctx context.Context, script *
 			return dynamicTrustDecision{}, fmt.Errorf("unexpected dynamic trust result type: %T", value)
 		}
 	}
-	if parsed[0] < 0 {
+	switch parsed[0] {
+	case -1:
 		return dynamicTrustDecision{}, errors.New("dynamic trust reservation no longer exists")
+	case -2:
+		return dynamicTrustDecision{}, errors.New("dynamic trust user quota cache is unavailable")
+	case -3:
+		return dynamicTrustDecision{}, errors.New("dynamic trust token quota cache is unavailable")
+	default:
+		if parsed[0] < 0 {
+			return dynamicTrustDecision{}, errors.New("dynamic trust returned an invalid state")
+		}
 	}
 	return dynamicTrustDecision{
 		Trusted:        parsed[0] > 0,

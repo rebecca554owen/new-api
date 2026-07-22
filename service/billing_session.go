@@ -117,8 +117,13 @@ func (s *BillingSession) finalizeDynamicTrust(actualQuota int) {
 }
 
 func (s *BillingSession) abandonDynamicTrust() {
-	if s.dynamicTrust != nil {
-		s.dynamicTrust.stopHeartbeat()
+	if s.dynamicTrust == nil {
+		return
+	}
+	s.dynamicTrust.stopHeartbeat()
+	if err := s.dynamicTrust.store.Release(context.Background(), s.dynamicTrust); err != nil {
+		common.SysLog(fmt.Sprintf("failed to release dynamic trust reservation on abandon (userId=%d, tokenId=%d, requestId=%s): %s",
+			s.dynamicTrust.userID, s.dynamicTrust.tokenID, s.dynamicTrust.requestID, err.Error()))
 	}
 }
 
@@ -145,15 +150,33 @@ func (s *BillingSession) Refund(c *gin.Context) {
 	if atomicQuota != nil {
 		gopool.Go(func() {
 			var lastErr error
+			hadUnknownResult := false
 			for attempt := 0; attempt < 3; attempt++ {
-				_, err := model.RefundAtomicQuota(atomicQuota)
+				result, err := model.RefundAtomicQuota(atomicQuota)
 				if err == nil {
+					if hadUnknownResult && result.AlreadyApplied {
+						if recordErr := model.RecordAtomicQuotaRefund(atomicQuota); recordErr != nil {
+							common.SysLog("error recording confirmed atomic quota refund: " + recordErr.Error())
+						}
+					}
 					return
 				}
 				lastErr = err
+				if !errors.Is(err, model.ErrAtomicQuotaUnavailable) {
+					common.SysLog(fmt.Sprintf("atomic quota refund failed with non-retryable state (userId=%d, tokenId=%d, requestId=%s): %s",
+						atomicQuota.UserID, atomicQuota.TokenID, atomicQuota.RequestID, err.Error()))
+					return
+				}
+				hadUnknownResult = true
+				if attempt < 2 {
+					time.Sleep(time.Duration(50<<attempt) * time.Millisecond)
+				}
 			}
-			common.SysLog(fmt.Sprintf("failed to refund atomic quota reservation (userId=%d, tokenId=%d, requestId=%s): %s",
+			common.SysLog(fmt.Sprintf("atomic quota refund exhausted retries, compensating batch records (userId=%d, tokenId=%d, requestId=%s): %s",
 				atomicQuota.UserID, atomicQuota.TokenID, atomicQuota.RequestID, lastErr.Error()))
+			if err := model.CompensateAtomicQuotaReservation(atomicQuota); err != nil {
+				common.SysLog("error compensating atomic quota batch records: " + err.Error())
+			}
 		})
 		return
 	}
@@ -295,10 +318,6 @@ func (s *BillingSession) preConsumeDynamicTrustFallback(targetQuota int) error {
 		reservation.stopHeartbeat()
 		s.trusted = false
 		s.dynamicTrust = nil
-		if err := reservation.store.Release(context.Background(), reservation); err != nil {
-			common.SysLog(fmt.Sprintf("failed to release dynamic trust reservation after atomic pre-consume fallback (userId=%d, tokenId=%d, requestId=%s): %s",
-				reservation.userID, reservation.tokenID, reservation.requestID, err.Error()))
-		}
 		return nil
 	}
 	if wallet, ok := s.funding.(*WalletFunding); ok {
@@ -411,6 +430,9 @@ func (s *BillingSession) acquireAtomicQuota(quota int) error {
 		TokenKey:       s.relayInfo.TokenKey,
 		TokenUnlimited: s.relayInfo.TokenUnlimited || s.relayInfo.IsPlayground,
 		Amount:         quota,
+	}
+	if s.dynamicTrust != nil {
+		reservation.DynamicTrustRequestID = s.dynamicTrust.requestID
 	}
 	result, err := model.AcquireAtomicQuota(reservation)
 	s.recordAtomicQuotaResult(result)
@@ -546,9 +568,8 @@ func (s *BillingSession) shouldTrust(c *gin.Context, quota int) bool {
 		RequestID:      requestID,
 		UserID:         s.relayInfo.UserId,
 		TokenID:        s.relayInfo.TokenId,
+		TokenKey:       s.relayInfo.TokenKey,
 		Amount:         quota,
-		UserQuota:      s.relayInfo.UserQuota,
-		TokenQuota:     tokenQuota,
 		TokenUnlimited: s.relayInfo.TokenUnlimited,
 		MinQuota:       trustQuota,
 		FactorMillis:   common.GetTrustQuotaDynamicFactorMillis(),
@@ -569,9 +590,8 @@ func (s *BillingSession) shouldTrust(c *gin.Context, quota int) bool {
 		requestID:      requestID,
 		userID:         s.relayInfo.UserId,
 		tokenID:        s.relayInfo.TokenId,
+		tokenKey:       s.relayInfo.TokenKey,
 		amount:         quota,
-		userQuota:      s.relayInfo.UserQuota,
-		tokenQuota:     tokenQuota,
 		tokenUnlimited: s.relayInfo.TokenUnlimited,
 		minQuota:       trustQuota,
 		factorMillis:   common.GetTrustQuotaDynamicFactorMillis(),

@@ -131,6 +131,16 @@ func setupDynamicTrustTest(t *testing.T, store *fakeDynamicTrustStore) (*gin.Con
 	return c, session
 }
 
+func seedDynamicTrustQuotaCache(t *testing.T, client *redis.Client, params dynamicTrustAcquireParams, userQuota, tokenQuota int) {
+	t.Helper()
+	require.NoError(t, client.HSet(context.Background(), fmt.Sprintf("user:%d", params.UserID), "Quota", userQuota).Err())
+	if params.TokenUnlimited {
+		return
+	}
+	tokenCacheKey := fmt.Sprintf("token:%s", common.GenerateHMAC(params.TokenKey))
+	require.NoError(t, client.HSet(context.Background(), tokenCacheKey, "RemainQuota", tokenQuota).Err())
+}
+
 func TestDynamicTrustReservationSettlesActualQuota(t *testing.T) {
 	store := &fakeDynamicTrustStore{decision: dynamicTrustDecision{Trusted: true, UserThreshold: 6_000_000}}
 	c, session := setupDynamicTrustTest(t, store)
@@ -292,6 +302,11 @@ func TestRedisDynamicTrustConcurrentAcquireAndRelease(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	store := &redisDynamicTrustStore{client: client}
+	baseParams := dynamicTrustAcquireParams{
+		UserID: 500, TokenID: 700, TokenKey: "concurrent-token", Amount: 100,
+		MinQuota: 1_000, FactorMillis: 1_500,
+	}
+	seedDynamicTrustQuotaCache(t, client, baseParams, 10_000, 10_000)
 
 	const requests = 100
 	var trustedCount atomic.Int64
@@ -302,10 +317,8 @@ func TestRedisDynamicTrustConcurrentAcquireAndRelease(t *testing.T) {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
-			params := dynamicTrustAcquireParams{
-				RequestID: fmt.Sprintf("concurrent-%d", index), UserID: 500, TokenID: 700,
-				Amount: 100, UserQuota: 10_000, TokenQuota: 10_000, MinQuota: 1_000, FactorMillis: 1_500,
-			}
+			params := baseParams
+			params.RequestID = fmt.Sprintf("concurrent-%d", index)
 			decision, err := store.Acquire(context.Background(), params)
 			if err != nil {
 				errors <- err
@@ -344,9 +357,10 @@ func TestRedisDynamicTrustIdempotentResizeSettleAndRelease(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 	store := &redisDynamicTrustStore{client: client}
 	params := dynamicTrustAcquireParams{
-		RequestID: "idempotent-request", UserID: 501, TokenID: 701,
-		Amount: 1_000, UserQuota: 100_000, TokenQuota: 100_000, MinQuota: 5_000, FactorMillis: 1_500,
+		RequestID: "idempotent-request", UserID: 501, TokenID: 701, TokenKey: "idempotent-token",
+		Amount: 1_000, MinQuota: 5_000, FactorMillis: 1_500,
 	}
+	seedDynamicTrustQuotaCache(t, client, params, 100_000, 100_000)
 
 	decision, err := store.Acquire(context.Background(), params)
 	require.NoError(t, err)
@@ -359,7 +373,7 @@ func TestRedisDynamicTrustIdempotentResizeSettleAndRelease(t *testing.T) {
 
 	reservation := &dynamicTrustReservation{
 		store: store, requestID: params.RequestID, userID: params.UserID, tokenID: params.TokenID,
-		amount: params.Amount, userQuota: params.UserQuota, tokenQuota: params.TokenQuota,
+		tokenKey: params.TokenKey, amount: params.Amount,
 		minQuota: params.MinQuota, factorMillis: params.FactorMillis,
 	}
 	decision, err = store.Resize(context.Background(), reservation, 2_000)
@@ -374,15 +388,74 @@ func TestRedisDynamicTrustIdempotentResizeSettleAndRelease(t *testing.T) {
 	assert.Equal(t, "0", server.HGet(keys[2], "user"))
 }
 
+func TestRedisDynamicTrustUsesLiveQuotaCache(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	store := &redisDynamicTrustStore{client: client}
+	params := dynamicTrustAcquireParams{
+		RequestID: "live-cache-request", UserID: 504, TokenID: 706, TokenKey: "live-cache-token",
+		Amount: 800, MinQuota: 100, FactorMillis: 1_500,
+	}
+	seedDynamicTrustQuotaCache(t, client, params, 1_000, 1_000)
+
+	decision, err := store.Acquire(context.Background(), params)
+
+	require.NoError(t, err)
+	assert.False(t, decision.Trusted)
+	assert.Equal(t, 1_200, decision.UserThreshold)
+}
+
+func TestRedisDynamicTrustUsesLiveTokenQuotaCache(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	store := &redisDynamicTrustStore{client: client}
+	params := dynamicTrustAcquireParams{
+		RequestID: "live-token-cache-request", UserID: 506, TokenID: 708, TokenKey: "live-token-cache",
+		Amount: 800, MinQuota: 100, FactorMillis: 1_500,
+	}
+	seedDynamicTrustQuotaCache(t, client, params, 10_000, 1_000)
+
+	decision, err := store.Acquire(context.Background(), params)
+
+	require.NoError(t, err)
+	assert.False(t, decision.Trusted)
+	assert.Equal(t, 1_200, decision.TokenThreshold)
+}
+
+func TestRedisDynamicTrustDuplicateDoesNotRequireQuotaCache(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	store := &redisDynamicTrustStore{client: client}
+	params := dynamicTrustAcquireParams{
+		RequestID: "duplicate-cache-request", UserID: 505, TokenID: 707, TokenKey: "duplicate-cache-token",
+		Amount: 100, MinQuota: 1_000, FactorMillis: 1_500,
+	}
+	seedDynamicTrustQuotaCache(t, client, params, 10_000, 10_000)
+	decision, err := store.Acquire(context.Background(), params)
+	require.NoError(t, err)
+	require.True(t, decision.Trusted)
+	decisionKeys := dynamicTrustDecisionKeys(params.UserID, params.TokenKey, false)
+	require.NoError(t, client.Del(context.Background(), decisionKeys[3], decisionKeys[4]).Err())
+
+	decision, err = store.Acquire(context.Background(), params)
+
+	require.NoError(t, err)
+	assert.True(t, decision.Trusted)
+}
+
 func TestRedisDynamicTrustAcquireCleansExpiredReservation(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	store := &redisDynamicTrustStore{client: client}
 	first := dynamicTrustAcquireParams{
-		RequestID: "expired-request", UserID: 502, TokenID: 702,
-		Amount: 2_000, UserQuota: 100_000, TokenQuota: 100_000, MinQuota: 5_000, FactorMillis: 1_500,
+		RequestID: "expired-request", UserID: 502, TokenID: 702, TokenKey: "expired-token",
+		Amount: 2_000, MinQuota: 5_000, FactorMillis: 1_500,
 	}
+	seedDynamicTrustQuotaCache(t, client, first, 100_000, 100_000)
 	decision, err := store.Acquire(context.Background(), first)
 	require.NoError(t, err)
 	require.True(t, decision.Trusted)
@@ -409,9 +482,10 @@ func TestRedisDynamicTrustAggregatesWalletAndSeparatesTokens(t *testing.T) {
 	store := &redisDynamicTrustStore{client: client}
 
 	first := dynamicTrustAcquireParams{
-		RequestID: "first-token", UserID: 503, TokenID: 703,
-		Amount: 2_000, UserQuota: 100_000, TokenQuota: 100_000, MinQuota: 500, FactorMillis: 1_500,
+		RequestID: "first-token", UserID: 503, TokenID: 703, TokenKey: "first-token-key",
+		Amount: 2_000, MinQuota: 500, FactorMillis: 1_500,
 	}
+	seedDynamicTrustQuotaCache(t, client, first, 100_000, 100_000)
 	decision, err := store.Acquire(context.Background(), first)
 	require.NoError(t, err)
 	require.True(t, decision.Trusted)
@@ -419,7 +493,9 @@ func TestRedisDynamicTrustAggregatesWalletAndSeparatesTokens(t *testing.T) {
 	second := first
 	second.RequestID = "second-token"
 	second.TokenID = 704
+	second.TokenKey = "second-token-key"
 	second.Amount = 1_000
+	seedDynamicTrustQuotaCache(t, client, second, 100_000, 100_000)
 	decision, err = store.Acquire(context.Background(), second)
 	require.NoError(t, err)
 	require.True(t, decision.Trusted)
@@ -428,7 +504,7 @@ func TestRedisDynamicTrustAggregatesWalletAndSeparatesTokens(t *testing.T) {
 
 	denied := second
 	denied.RequestID = "second-token-denied"
-	denied.TokenQuota = 2_500
+	seedDynamicTrustQuotaCache(t, client, denied, 100_000, 2_500)
 	decision, err = store.Acquire(context.Background(), denied)
 	require.NoError(t, err)
 	assert.False(t, decision.Trusted)

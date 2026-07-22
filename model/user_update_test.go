@@ -92,6 +92,22 @@ func TestUpdateUserSettingOnlyUpdatesSetting(t *testing.T) {
 	assert.Equal(t, "zh", got.GetSetting().Language)
 }
 
+func TestDirectUserQuotaDecreaseRejectsInsufficientBalance(t *testing.T) {
+	setupUserUpdateTestState(t)
+	user := User{
+		Id: 3, Username: "direct-quota-user", Password: "password",
+		Status: common.UserStatusEnabled, Quota: 100,
+	}
+	require.NoError(t, DB.Create(&user).Error)
+
+	err := decreaseUserQuota(user.Id, 101)
+
+	require.Error(t, err)
+	var got User
+	require.NoError(t, DB.First(&got, user.Id).Error)
+	assert.Equal(t, 100, got.Quota)
+}
+
 func TestEnsureEmailAvailableRejectsExistingEmailCaseInsensitive(t *testing.T) {
 	setupUserUpdateTestState(t)
 

@@ -1,11 +1,13 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 
@@ -77,6 +79,131 @@ func TestAtomicQuotaLifecycleIsIdempotent(t *testing.T) {
 	batchUpdateLocks[BatchUpdateTypeTokenQuota].Unlock()
 	assert.Equal(t, -80, userDelta)
 	assert.Equal(t, -80, tokenDelta)
+}
+
+func TestCompensateAtomicQuotaReservationOffsetsQueuedDebit(t *testing.T) {
+	reservation := setupAtomicQuotaTest(t, 1000, 1000)
+
+	_, err := AcquireAtomicQuota(reservation)
+	require.NoError(t, err)
+	common.RDB = nil
+	require.NoError(t, CompensateAtomicQuotaReservation(reservation))
+
+	batchUpdateLocks[BatchUpdateTypeUserQuota].Lock()
+	userDelta := batchUpdateStores[BatchUpdateTypeUserQuota][reservation.UserID]
+	batchUpdateLocks[BatchUpdateTypeUserQuota].Unlock()
+	batchUpdateLocks[BatchUpdateTypeTokenQuota].Lock()
+	tokenDelta := batchUpdateStores[BatchUpdateTypeTokenQuota][reservation.TokenID]
+	batchUpdateLocks[BatchUpdateTypeTokenQuota].Unlock()
+	assert.Zero(t, userDelta)
+	assert.Zero(t, tokenDelta)
+}
+
+func TestRecordAtomicQuotaRefundDoesNotChangeRedisBalance(t *testing.T) {
+	reservation := setupAtomicQuotaTest(t, 1_000, 1_000)
+	_, err := AcquireAtomicQuota(reservation)
+	require.NoError(t, err)
+	result, err := RefundAtomicQuota(reservation)
+	require.NoError(t, err)
+	assert.Equal(t, 1_000, result.UserQuota)
+
+	resetBatchUpdateStores()
+	require.NoError(t, RecordAtomicQuotaRefund(reservation))
+
+	quota, quotaErr := getUserQuotaCache(reservation.UserID)
+	require.NoError(t, quotaErr)
+	assert.Equal(t, 1_000, quota)
+	batchUpdateLocks[BatchUpdateTypeUserQuota].Lock()
+	userDelta := batchUpdateStores[BatchUpdateTypeUserQuota][reservation.UserID]
+	batchUpdateLocks[BatchUpdateTypeUserQuota].Unlock()
+	assert.Equal(t, reservation.Amount, userDelta)
+}
+
+func TestAtomicQuotaAcquireAccountsForDynamicPending(t *testing.T) {
+	reservation := setupAtomicQuotaTest(t, 1_000, 1_000)
+	trustKeys := common.DynamicTrustRedisKeys(reservation.UserID)
+	require.NoError(t, common.RDB.HSet(context.Background(), trustKeys[2],
+		"user", 600, fmt.Sprintf("token:%d", reservation.TokenID), 600).Err())
+	reservation.Amount = 500
+
+	_, err := AcquireAtomicQuota(reservation)
+
+	assert.ErrorIs(t, err, ErrAtomicUserQuotaInsufficient)
+	quota, quotaErr := getUserQuotaCache(reservation.UserID)
+	require.NoError(t, quotaErr)
+	assert.Equal(t, 1_000, quota)
+}
+
+func TestAtomicQuotaAcquireAccountsForTokenDynamicPending(t *testing.T) {
+	reservation := setupAtomicQuotaTest(t, 2_000, 1_000)
+	trustKeys := common.DynamicTrustRedisKeys(reservation.UserID)
+	require.NoError(t, common.RDB.HSet(context.Background(), trustKeys[2],
+		"user", 0, fmt.Sprintf("token:%d", reservation.TokenID), 600).Err())
+	reservation.Amount = 500
+
+	_, err := AcquireAtomicQuota(reservation)
+
+	assert.ErrorIs(t, err, ErrAtomicTokenQuotaInsufficient)
+}
+
+func TestAtomicQuotaAcquireConvertsOwnDynamicReservation(t *testing.T) {
+	reservation := setupAtomicQuotaTest(t, 1_000, 1_000)
+	reservation.Amount = 800
+	reservation.DynamicTrustRequestID = reservation.RequestID
+	trustKeys := common.DynamicTrustRedisKeys(reservation.UserID)
+	ctx := context.Background()
+	require.NoError(t, common.RDB.HSet(ctx, trustKeys[1],
+		reservation.RequestID+":amount", 300,
+		reservation.RequestID+":token", reservation.TokenID).Err())
+	require.NoError(t, common.RDB.HSet(ctx, trustKeys[2],
+		"user", 300, fmt.Sprintf("token:%d", reservation.TokenID), 300).Err())
+	require.NoError(t, common.RDB.ZAdd(ctx, trustKeys[0], &redis.Z{
+		Score: float64(time.Now().Add(time.Minute).UnixMilli()), Member: reservation.RequestID,
+	}).Err())
+
+	result, err := AcquireAtomicQuota(reservation)
+
+	require.NoError(t, err)
+	assert.True(t, result.TrustConverted)
+	assert.Equal(t, 200, result.UserQuota)
+	assert.False(t, common.RDB.HExists(ctx, trustKeys[1], reservation.RequestID+":amount").Val())
+	assert.Equal(t, "0", common.RDB.HGet(ctx, trustKeys[2], "user").Val())
+	assert.Equal(t, "0", common.RDB.HGet(ctx, trustKeys[2], fmt.Sprintf("token:%d", reservation.TokenID)).Val())
+}
+
+func TestAtomicQuotaAcquireConvertsUnlimitedTokenTrust(t *testing.T) {
+	reservation := setupAtomicQuotaTest(t, 1_000, 1_000)
+	reservation.TokenUnlimited = true
+	reservation.Amount = 800
+	reservation.DynamicTrustRequestID = reservation.RequestID
+	trustKeys := common.DynamicTrustRedisKeys(reservation.UserID)
+	ctx := context.Background()
+	require.NoError(t, common.RDB.HSet(ctx, trustKeys[1],
+		reservation.RequestID+":amount", 300,
+		reservation.RequestID+":token", 0).Err())
+	require.NoError(t, common.RDB.HSet(ctx, trustKeys[2], "user", 300).Err())
+
+	result, err := AcquireAtomicQuota(reservation)
+
+	require.NoError(t, err)
+	assert.True(t, result.TrustConverted)
+	assert.Equal(t, 200, result.UserQuota)
+	assert.Equal(t, "0", common.RDB.HGet(ctx, trustKeys[2], "user").Val())
+}
+
+func TestAtomicQuotaResizeAccountsForDynamicPending(t *testing.T) {
+	reservation := setupAtomicQuotaTest(t, 1_000, 1_000)
+	reservation.Amount = 400
+	_, err := AcquireAtomicQuota(reservation)
+	require.NoError(t, err)
+	trustKeys := common.DynamicTrustRedisKeys(reservation.UserID)
+	require.NoError(t, common.RDB.HSet(context.Background(), trustKeys[2],
+		"user", 400, fmt.Sprintf("token:%d", reservation.TokenID), 400).Err())
+
+	_, err = ResizeAtomicQuota(reservation, 700)
+
+	assert.ErrorIs(t, err, ErrAtomicUserQuotaInsufficient)
+	assert.Equal(t, 400, reservation.Amount)
 }
 
 func TestAtomicQuotaConcurrentAcquireDoesNotOversubscribe(t *testing.T) {
